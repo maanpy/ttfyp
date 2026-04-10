@@ -118,6 +118,7 @@ def run_scraper(user_id: int, target: int, pause: float,
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
                 ]
             )
             context = browser.new_context(
@@ -127,7 +128,18 @@ def run_scraper(user_id: int, target: int, pause: float,
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1280, "height": 900},
+                java_script_enabled=True,
+                has_touch=False,
+                locale="en-US",
+                timezone_id="America/New_York",
             )
+
+            # Remove webdriver fingerprint TikTok detects
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            """)
 
             # Inject login cookies if available
             if TIKTOK_COOKIES:
@@ -135,18 +147,22 @@ def run_scraper(user_id: int, target: int, pause: float,
                 logger.info("TikTok cookies injected into browser context.")
 
             page = context.new_page()
+
+            # Use domcontentloaded (faster) then wait manually for JS
             page.goto("https://www.tiktok.com/foryou",
-                      wait_until="networkidle", timeout=30_000)
+                      wait_until="domcontentloaded", timeout=45_000)
+            time.sleep(5)
 
-            # Check if logged in
+            # Check login status
             is_logged_in = page.query_selector("[data-e2e='nav-profile']") is not None
-            logger.info(f"TikTok login status: {'logged in' if is_logged_in else 'not logged in - may hit login wall'}")
+            logger.info(f"Login status: {'logged in' if is_logged_in else 'not logged in'}")
 
-            # Dismiss banners
+            # Dismiss any popups/banners
             for selector in [
                 "button:has-text('Accept all')",
                 "button:has-text('I am 18+')",
                 "[data-e2e='cookie-banner-accept']",
+                "[data-e2e='modal-close-inner-button']",
             ]:
                 try:
                     page.click(selector, timeout=2000)
@@ -154,21 +170,43 @@ def run_scraper(user_id: int, target: int, pause: float,
                 except Exception:
                     pass
 
+            # Wait for videos to appear
+            try:
+                page.wait_for_selector(
+                    "a[href*='/video/']",
+                    timeout=15_000
+                )
+            except Exception:
+                logger.warning("Timed out waiting for video links")
+
             scroll_attempts = 0
-            max_attempts = target * 4
+            max_attempts = target * 6
+            no_new_count = 0
 
             while len(collected) < target and scroll_attempts < max_attempts:
                 if stop_event.is_set():
                     break
 
-                links = page.eval_on_selector_all(
+                # Method 1: anchor tags
+                links_from_anchors = page.eval_on_selector_all(
                     "a[href*='/video/']",
                     "els => els.map(e => e.href)"
                 )
+
+                # Method 2: regex scan of full page HTML (catches lazy-loaded links)
+                page_content = page.content()
+                links_from_source = TIKTOK_VIDEO_PATTERN.findall(page_content)
+
+                all_links = set(links_from_anchors) | set(links_from_source)
                 new_links = {
-                    l.split("?")[0] for l in links
+                    l.split("?")[0] for l in all_links
                     if TIKTOK_VIDEO_PATTERN.match(l.split("?")[0])
                 } - seen
+
+                if not new_links:
+                    no_new_count += 1
+                else:
+                    no_new_count = 0
 
                 for url in new_links:
                     if len(collected) >= target or stop_event.is_set():
@@ -180,13 +218,37 @@ def run_scraper(user_id: int, target: int, pause: float,
                         "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     }
                     collected.append(entry)
-                    # Progress update every 10 items
                     if len(collected) % 10 == 0 or len(collected) == target:
                         on_progress(len(collected), target)
 
+                # Scroll down one viewport
                 page.evaluate("window.scrollBy(0, window.innerHeight)")
                 time.sleep(pause)
+
+                # Every 5 scrolls do an extra nudge to trigger lazy loading
+                if scroll_attempts % 5 == 0:
+                    page.evaluate("window.scrollBy(0, 300)")
+                    time.sleep(0.8)
+
                 scroll_attempts += 1
+
+                # If stuck, try keyboard
+                if no_new_count >= 8:
+                    logger.warning("No new links for 8 attempts, trying ArrowDown")
+                    try:
+                        page.keyboard.press("ArrowDown")
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                    no_new_count = 0
+
+            # Save debug screenshot if nothing collected
+            if not collected:
+                try:
+                    page.screenshot(path="/tmp/tiktok_debug.png", full_page=False)
+                    logger.warning("0 results — debug screenshot saved to /tmp/tiktok_debug.png")
+                except Exception:
+                    pass
 
             browser.close()
 
@@ -464,6 +526,59 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Output format set to *{val.upper()}*.", parse_mode="Markdown")
 
 
+@auth_required
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Take a screenshot of what TikTok shows the bot and send it."""
+    uid = update.effective_user.id
+    await update.message.reply_text("📸 Taking a screenshot of TikTok... please wait ~15s")
+
+    def take_screenshot():
+        try:
+            from playwright.sync_api import sync_playwright
+            import base64
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 900},
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+                if TIKTOK_COOKIES:
+                    context.add_cookies(TIKTOK_COOKIES)
+                page = context.new_page()
+                page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=30_000)
+                import time
+                time.sleep(5)
+                path = "/tmp/tiktok_debug.png"
+                page.screenshot(path=path, full_page=False)
+                browser.close()
+            return path
+        except Exception as e:
+            return str(e)
+
+    loop = asyncio.get_event_loop()
+
+    def run():
+        result = take_screenshot()
+        async def send():
+            if result.endswith(".png"):
+                with open(result, "rb") as f:
+                    await ctx.bot.send_photo(
+                        chat_id=uid,
+                        photo=f,
+                        caption="🖥 This is what TikTok shows the scraper. If you see a login wall or CAPTCHA, cookies may have expired."
+                    )
+            else:
+                await ctx.bot.send_message(chat_id=uid, text=f"❌ Screenshot failed: {result}")
+        asyncio.run_coroutine_threadsafe(send(), loop)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 # ─── UNKNOWN COMMAND ──────────────────────────────────────────────────────────
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -483,6 +598,7 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("download", cmd_download))
     app.add_handler(CommandHandler("cookies",  cmd_cookiestatus))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
