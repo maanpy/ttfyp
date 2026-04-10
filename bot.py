@@ -164,14 +164,21 @@ def run_scraper(user_id: int, target: int, pause: float,
                                     item.get("id") or
                                     item.get("video", {}).get("id")
                                 )
+                                # Try every possible field for the real username
+                                author_obj = item.get("author") or {}
                                 author = (
-                                    item.get("author", {}).get("unique_id") or
-                                    item.get("author", {}).get("sec_uid") or
-                                    "user"
+                                    author_obj.get("unique_id") or        # e.g. "charlidamelio"
+                                    author_obj.get("nickname") or         # display name fallback
+                                    item.get("authorMeta", {}).get("name") or
+                                    item.get("music", {}).get("author") or
+                                    None
                                 )
-                                if aweme_id:
+                                if aweme_id and author and author != "user":
                                     video_url = f"https://www.tiktok.com/@{author}/video/{aweme_id}"
                                     api_urls.append(video_url)
+                                elif aweme_id:
+                                    # Store just the ID — we'll resolve username from page HTML
+                                    api_urls.append(f"__ID__{aweme_id}")
                         except Exception:
                             pass
                 except Exception:
@@ -224,7 +231,11 @@ def run_scraper(user_id: int, target: int, pause: float,
                     break
 
                 # ── Method 1: From intercepted API calls ──────────────────
+                pending_ids = []
                 for url in list(api_urls):
+                    if url.startswith("__ID__"):
+                        pending_ids.append(url[6:])
+                        continue
                     clean = url.split("?")[0]
                     if clean not in seen and TIKTOK_VIDEO_PATTERN.match(clean):
                         seen.add(clean)
@@ -238,6 +249,31 @@ def run_scraper(user_id: int, target: int, pause: float,
                         if len(collected) >= target:
                             break
                 api_urls.clear()
+
+                # Resolve any bare video IDs by finding them in page HTML
+                if pending_ids:
+                    page_html_for_ids = page.content()
+                    for vid_id in pending_ids:
+                        # Find the matching full URL in page source
+                        import re as _re
+                        pattern = r'https://www\.tiktok\.com/@([\w\.]+)/video/' + vid_id
+                        match = _re.search(pattern,
+                            page_html_for_ids
+                        )
+                        if match:
+                            clean = f"https://www.tiktok.com/@{match.group(1)}/video/{vid_id}"
+                        else:
+                            # Last resort: use the video ID with a placeholder we can note
+                            clean = f"https://www.tiktok.com/video/{vid_id}"
+                        if clean not in seen:
+                            seen.add(clean)
+                            collected.append({
+                                "index": len(collected) + 1,
+                                "url": clean,
+                                "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            })
+                            if len(collected) % 10 == 0 or len(collected) == target:
+                                on_progress(len(collected), target)
 
                 # ── Method 2: Scan page HTML ──────────────────────────────
                 page_html = page.content()
