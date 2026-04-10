@@ -33,8 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── ENV CONFIG ───────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "")  # comma-separated telegram user IDs
+TELEGRAM_TOKEN = os.environ["8775075853:AAE5GdEWMslLbC3hgeQwcJWbqC0Lu2aryXw"]
+ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "1843522522")  # comma-separated telegram user IDs
 ALLOWED_USERS = set(
     int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip()
 )
