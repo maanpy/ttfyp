@@ -188,7 +188,7 @@ def run_scraper(user_id: int, target: int, pause: float,
             logger.info("Loading TikTok FYP...")
             page.goto("https://www.tiktok.com/foryou",
                       wait_until="domcontentloaded", timeout=45_000)
-            time.sleep(6)
+            time.sleep(10)
 
             # Dismiss popups
             for selector in [
@@ -202,6 +202,17 @@ def run_scraper(user_id: int, target: int, pause: float,
                     time.sleep(0.5)
                 except Exception:
                     pass
+
+            # Wait for the FYP video container to appear
+            try:
+                page.wait_for_selector(
+                    "[class*='DivItemContainer'], [class*='video-feed'], a[href*='/video/']",
+                    timeout=15_000
+                )
+                logger.info("Video container found on page")
+                time.sleep(3)
+            except Exception:
+                logger.warning("Video container not found - proceeding anyway")
 
             scroll_attempts = 0
             max_attempts = target * 5
@@ -273,22 +284,31 @@ def run_scraper(user_id: int, target: int, pause: float,
                     stuck_count = 0
                 last_count = len(collected)
 
-                # Scroll
-                page.evaluate("window.scrollBy(0, window.innerHeight)")
-                time.sleep(pause)
+                # TikTok FYP is a vertical video player - use arrow key like a real user
+                try:
+                    # Click center of page first to make sure it has focus
+                    if scroll_attempts == 0:
+                        page.mouse.click(640, 450)
+                        time.sleep(1)
+                    # Press down arrow to go to next video
+                    page.keyboard.press("ArrowDown")
+                except Exception:
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
 
-                # Extra nudge every 5 scrolls
-                if scroll_attempts % 5 == 0:
-                    page.evaluate("window.scrollBy(0, 400)")
-                    time.sleep(0.5)
+                time.sleep(max(pause, 3.0))  # wait for next video to load
 
-                # If totally stuck for 15 attempts, log warning
+                # Every 10 videos also do a scroll just in case
+                if scroll_attempts % 10 == 0:
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    time.sleep(1)
+
+                # If stuck for 15 attempts, try clicking the down arrow button on screen
                 if stuck_count == 15:
                     logger.warning(f"Stuck at {len(collected)} results after {scroll_attempts} scrolls")
-                    # Try clicking on the page to wake it up
                     try:
-                        page.mouse.click(640, 400)
-                        time.sleep(1)
+                        # Try the on-screen next video button
+                        page.click("[data-e2e='arrow-down'], [class*='ButtonDown'], .swiper-button-next", timeout=2000)
+                        time.sleep(2)
                     except Exception:
                         pass
 
