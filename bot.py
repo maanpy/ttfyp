@@ -33,11 +33,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── ENV CONFIG ───────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["8775075853:AAE5GdEWMslLbC3hgeQwcJWbqC0Lu2aryXw"]
-ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "1843522522")  # comma-separated telegram user IDs
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "")  # comma-separated telegram user IDs
 ALLOWED_USERS = set(
     int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip()
 )
+
+def load_tiktok_cookies() -> list[dict] | None:
+    """Load TikTok cookies from TIKTOK_COOKIES env var (JSON array)."""
+    raw = os.environ.get("TIKTOK_COOKIES", "").strip()
+    if not raw:
+        return None
+    try:
+        import json
+        cookies = json.loads(raw)
+        # Normalize: Playwright needs 'sameSite' as title-case
+        samesite_map = {"strict": "Strict", "lax": "Lax", "no_restriction": "None", "none": "None"}
+        for c in cookies:
+            # Remove keys Playwright doesn't accept
+            for key in ["hostOnly", "session", "storeId", "id"]:
+                c.pop(key, None)
+            # Fix sameSite value
+            if "sameSite" in c:
+                c["sameSite"] = samesite_map.get(c["sameSite"].lower(), "Lax")
+            else:
+                c["sameSite"] = "Lax"
+            # Ensure domain is correct
+            if not c.get("domain", "").endswith("tiktok.com"):
+                c["domain"] = ".tiktok.com"
+        logger.info(f"Loaded {len(cookies)} TikTok cookies from env.")
+        return cookies
+    except Exception as e:
+        logger.warning(f"Failed to parse TIKTOK_COOKIES: {e}")
+        return None
+
+TIKTOK_COOKIES = load_tiktok_cookies()
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Per-user scrape state
@@ -99,9 +129,18 @@ def run_scraper(user_id: int, target: int, pause: float,
                 viewport={"width": 1280, "height": 900},
             )
 
+            # Inject login cookies if available
+            if TIKTOK_COOKIES:
+                context.add_cookies(TIKTOK_COOKIES)
+                logger.info("TikTok cookies injected into browser context.")
+
             page = context.new_page()
             page.goto("https://www.tiktok.com/foryou",
                       wait_until="networkidle", timeout=30_000)
+
+            # Check if logged in
+            is_logged_in = page.query_selector("[data-e2e='nav-profile']") is not None
+            logger.info(f"TikTok login status: {'logged in' if is_logged_in else 'not logged in - may hit login wall'}")
 
             # Dismiss banners
             for selector in [
@@ -373,6 +412,31 @@ async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── INLINE KEYBOARD CALLBACKS ────────────────────────────────────────────────
+@auth_required
+async def cmd_cookiestatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show whether TikTok cookies are loaded."""
+    if TIKTOK_COOKIES:
+        names = [c.get("name", "?") for c in TIKTOK_COOKIES[:8]]
+        await update.message.reply_text(
+            f"🍪 *Cookies loaded:* {len(TIKTOK_COOKIES)} cookies\n"
+            f"Keys: `{', '.join(names)}{'...' if len(TIKTOK_COOKIES) > 8 else ''}`\n\n"
+            f"✅ Bot will log in automatically when scraping.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ *No cookies loaded.*\n\n"
+            "Scraper will run without login — TikTok may show a login wall.\n\n"
+            "To add cookies:\n"
+            "1️⃣ Log into tiktok.com in Chrome\n"
+            "2️⃣ Install *Cookie-Editor* extension\n"
+            "3️⃣ Export as JSON\n"
+            "4️⃣ Add `TIKTOK_COOKIES` env var in Railway with the JSON value\n"
+            "5️⃣ Redeploy",
+            parse_mode="Markdown"
+        )
+
+
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
@@ -418,6 +482,7 @@ def main():
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("download", cmd_download))
+    app.add_handler(CommandHandler("cookies",  cmd_cookiestatus))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
