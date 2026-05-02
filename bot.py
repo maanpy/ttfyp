@@ -1,581 +1,718 @@
 """
-TikTok FYP Scraper Bot — Telegram Controller
-Supports full JSON cookie export (EditThisCookie, Cookie-Editor, etc.)
+TikTok FYP Scraper — Telegram Bot Controller
+=============================================
+Control your TikTok scraper entirely from Telegram.
+Deployed on Railway.
 """
 
-import os, csv, re, time, json, asyncio, logging, threading
+import os
+import csv
+import re
+import time
+import asyncio
+import logging
+import threading
 from io import StringIO
 from datetime import datetime
 from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "")
-ALLOWED_USERS     = set(int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip())
-TIKTOK_SESSION    = os.environ.get("TIKTOK_SESSION", "").strip()
+# ─── ENV CONFIG ───────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "")  # comma-separated telegram user IDs
+ALLOWED_USERS = set(
+    int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip()
+)
 
-# Support multiple cookie sources from Railway
-TIKTOK_COOKIES_JSON = os.environ.get("TIKTOK_COOKIES_JSON", "").strip()  # Full JSON array
-TIKTOK_SESSIONID    = os.environ.get("TIKTOK_SESSIONID", "").strip()      # Just sessionid value
-
-_runtime_cookies = []
-_runtime_cookies_lock = threading.Lock()
-
-TIKTOK_VIDEO_RE = re.compile(r'https://www\.tiktok\.com/@[\w.]+/video/\d+')
-
-SAMESITE_MAP = {
-    "no_restriction": "None", "none": "None",
-    "lax": "Lax", "strict": "Strict",
-    "unspecified": "Lax", "": "Lax",
-}
-
-def _clean_cookie(c):
-    samesite_raw = (c.get("sameSite") or c.get("same_site") or "lax").lower()
-    out = {
-        "name":     c.get("name", ""),
-        "value":    str(c.get("value", "")),
-        "domain":   ".tiktok.com",
-        "path":     c.get("path", "/") or "/",
-        "secure":   bool(c.get("secure", False)),
-        "httpOnly": bool(c.get("httpOnly", c.get("http_only", False))),
-        "sameSite": SAMESITE_MAP.get(samesite_raw, "Lax"),
-    }
-    exp = c.get("expirationDate") or c.get("expires") or c.get("expiry")
-    if exp:
-        try:
-            out["expires"] = int(float(exp))
-        except (ValueError, TypeError):
-            pass
-    return out
-
-def parse_cookies(raw):
-    raw = raw.strip()
+def load_tiktok_cookies() -> list[dict] | None:
+    """Load TikTok cookies from TIKTOK_COOKIES env var (JSON array)."""
+    raw = os.environ.get("TIKTOK_COOKIES", "").strip()
     if not raw:
-        return [], "Empty input"
-    if raw.startswith("["):
-        try:
-            arr = json.loads(raw)
-        except json.JSONDecodeError as e:
-            return [], f"JSON parse error: {e}\n\nMake sure you copied the FULL JSON including [ and ] brackets."
-        if not isinstance(arr, list):
-            return [], "Expected a JSON array starting with ["
-        cleaned, seen = [], set()
-        for c in arr:
-            if not isinstance(c, dict):
-                continue
-            name = c.get("name", "")
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(_clean_cookie(c))
-        if not cleaned:
-            return [], "JSON parsed but no cookies found. Check the format."
-        has_session = any(c["name"] == "sessionid" for c in cleaned)
-        if not has_session:
-            return cleaned, "Warning: no 'sessionid' found - TikTok may not be logged in."
-        return cleaned, ""
-    if len(raw) > 20:
-        cookies = [
-            {"name": "sessionid",    "value": raw, "domain": ".tiktok.com", "path": "/", "secure": True, "httpOnly": True, "sameSite": "Lax"},
-            {"name": "sessionid_ss", "value": raw, "domain": ".tiktok.com", "path": "/", "secure": True, "httpOnly": True, "sameSite": "None"},
-            {"name": "sid_tt",       "value": raw, "domain": ".tiktok.com", "path": "/", "secure": True, "httpOnly": True, "sameSite": "Lax"},
-        ]
-        return cookies, ""
-    return [], "Unrecognized format. Use /setcookies for instructions."
+        return None
+    try:
+        import json
+        cookies = json.loads(raw)
+        # Normalize: Playwright needs 'sameSite' as title-case
+        samesite_map = {"strict": "Strict", "lax": "Lax", "no_restriction": "None", "none": "None"}
+        for c in cookies:
+            # Remove keys Playwright doesn't accept
+            for key in ["hostOnly", "session", "storeId", "id"]:
+                c.pop(key, None)
+            # Fix sameSite value
+            if "sameSite" in c:
+                c["sameSite"] = samesite_map.get(c["sameSite"].lower(), "Lax")
+            else:
+                c["sameSite"] = "Lax"
+            # Ensure domain is correct
+            if not c.get("domain", "").endswith("tiktok.com"):
+                c["domain"] = ".tiktok.com"
+        logger.info(f"Loaded {len(cookies)} TikTok cookies from env.")
+        return cookies
+    except Exception as e:
+        logger.warning(f"Failed to parse TIKTOK_COOKIES: {e}")
+        return None
 
-def get_active_cookies():
-    """Get cookies from runtime, then fallback to Railway env vars."""
-    with _runtime_cookies_lock:
-        if _runtime_cookies:
-            return list(_runtime_cookies)
+TIKTOK_COOKIES = load_tiktok_cookies()
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # Try full JSON from Railway first
-    if TIKTOK_COOKIES_JSON:
-        cookies, _ = parse_cookies(TIKTOK_COOKIES_JSON)
-        if cookies:
-            return cookies
+# Per-user scrape state
+user_state: dict[int, dict] = defaultdict(lambda: {
+    "running": False,
+    "target": 50,
+    "pause": 2.5,
+    "results": [],
+    "thread": None,
+    "stop_event": None,
+})
 
-    # Fallback to old TIKTOK_SESSION format
-    if TIKTOK_SESSION:
-        cookies, _ = parse_cookies(TIKTOK_SESSION)
-        if cookies:
-            return cookies
+TIKTOK_VIDEO_PATTERN = re.compile(
+    r"https://www\.tiktok\.com/@[\w.]+/video/\d+"
+)
 
-    # Last resort: just sessionid
-    if TIKTOK_SESSIONID:
-        cookies, _ = parse_cookies(TIKTOK_SESSIONID)
-        if cookies:
-            return cookies
-
-    return []
-
-def is_allowed(uid):
-    return not ALLOWED_USERS or uid in ALLOWED_USERS
+# ─── AUTH HELPER ──────────────────────────────────────────────────────────────
+def is_allowed(user_id: int) -> bool:
+    if not ALLOWED_USERS:
+        return True  # open to all if no whitelist set
+    return user_id in ALLOWED_USERS
 
 def auth_required(func):
-    async def wrapper(update, ctx):
-        if not is_allowed(update.effective_user.id):
-            await update.effective_message.reply_text("Not authorized.")
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not is_allowed(uid):
+            await update.effective_message.reply_text("⛔ You are not authorized to use this bot.")
             return
         return await func(update, ctx)
     wrapper.__name__ = func.__name__
     return wrapper
 
-user_state = defaultdict(lambda: {
-    "running": False, "results": [], "stop_event": None,
-    "fmt": "csv", "status_msg_id": None
-})
-
-def run_scraper(user_id, target, stop_event, on_progress, on_done, on_error):
+# ─── SCRAPER (runs in background thread) ──────────────────────────────────────
+def run_scraper(user_id: int, target: int, pause: float,
+                stop_event: threading.Event,
+                on_progress, on_done, on_error):
     try:
         from playwright.sync_api import sync_playwright
-        cookies = get_active_cookies()
-        collected, seen, api_urls = [], set(), []
+        import json as _json
+
+        collected = []
+        seen = set()
+        api_urls = []  # collected from network interception
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox","--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage","--disable-gpu",
-                      "--disable-blink-features=AutomationControlled"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ]
             )
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
                 viewport={"width": 1280, "height": 900},
+                java_script_enabled=True,
                 locale="en-US",
+                timezone_id="America/New_York",
             )
+
+            # Hide automation fingerprints
             context.add_init_script("""
-                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-                Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
-                Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
-                window.chrome={runtime:{}};
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
             """)
-            if cookies:
-                context.add_cookies(cookies)
-            def on_response(response):
+
+            # ── Intercept TikTok API responses ──────────────────────────────
+            def handle_response(response):
                 try:
                     url = response.url
-                    if any(k in url for k in [
-                        "recommend/item_list","feed","aweme/v1","item_list",
-                        "api/recommend","api-h2/feed","tiktok.com/api/",
-                        "aweme/v2","mix/item_list","related/item_list"
-                    ]):
+                    # TikTok FYP API endpoint
+                    if "recommend/item_list" in url or "feed" in url or "aweme/v1" in url:
                         try:
                             body = response.json()
-                            items = (body.get("aweme_list") or body.get("itemList") or body.get("item_list") or [])
+                            # TikTok API returns aweme_list with video objects
+                            items = (
+                                body.get("aweme_list") or
+                                body.get("itemList") or
+                                body.get("item_list") or
+                                []
+                            )
                             for item in items:
-                                aweme_id = item.get("aweme_id") or item.get("id")
-                                author = (item.get("author") or {}).get("unique_id")
-                                if aweme_id and author:
-                                    api_urls.append("https://www.tiktok.com/@" + str(author) + "/video/" + str(aweme_id))
+                                aweme_id = (
+                                    item.get("aweme_id") or
+                                    item.get("id") or
+                                    item.get("video", {}).get("id")
+                                )
+                                # Try every possible field for the real username
+                                author_obj = item.get("author") or {}
+                                author = (
+                                    author_obj.get("unique_id") or        # e.g. "charlidamelio"
+                                    author_obj.get("nickname") or         # display name fallback
+                                    item.get("authorMeta", {}).get("name") or
+                                    item.get("music", {}).get("author") or
+                                    None
+                                )
+                                if aweme_id and author and author != "user":
+                                    video_url = f"https://www.tiktok.com/@{author}/video/{aweme_id}"
+                                    api_urls.append(video_url)
+                                elif aweme_id:
+                                    # Store just the ID — we'll resolve username from page HTML
+                                    api_urls.append(f"__ID__{aweme_id}")
                         except Exception:
                             pass
                 except Exception:
                     pass
+
             page = context.new_page()
-            page.on("response", on_response)
-            page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=45000)
-            time.sleep(8)
-            for sel in ["button:has-text('Accept all')","[data-e2e='cookie-banner-accept']","[data-e2e='modal-close-inner-button']"]:
+            page.on("response", handle_response)
+
+            # Inject cookies
+            if TIKTOK_COOKIES:
+                context.add_cookies(TIKTOK_COOKIES)
+                logger.info("Cookies injected.")
+
+            logger.info("Loading TikTok FYP...")
+            page.goto("https://www.tiktok.com/foryou",
+                      wait_until="domcontentloaded", timeout=45_000)
+            time.sleep(10)
+
+            # Dismiss popups
+            for selector in [
+                "button:has-text('Accept all')",
+                "button:has-text('I am 18+')",
+                "[data-e2e='cookie-banner-accept']",
+                "[data-e2e='modal-close-inner-button']",
+            ]:
                 try:
-                    page.click(sel, timeout=2000)
+                    page.click(selector, timeout=2000)
                     time.sleep(0.5)
                 except Exception:
                     pass
+
+            # Wait for the FYP video container to appear
             try:
-                page.wait_for_selector("a[href*='/video/']", timeout=12000)
+                page.wait_for_selector(
+                    "[class*='DivItemContainer'], [class*='video-feed'], a[href*='/video/']",
+                    timeout=15_000
+                )
+                logger.info("Video container found on page")
+                time.sleep(3)
             except Exception:
-                pass
-            try:
-                page.mouse.click(640, 450)
-                time.sleep(1)
-            except Exception:
-                pass
+                logger.warning("Video container not found - proceeding anyway")
+
             scroll_attempts = 0
-            stuck = 0
+            max_attempts = target * 5
             last_count = 0
-            while len(collected) < target and scroll_attempts < target * 8:
+            stuck_count = 0
+
+            while len(collected) < target and scroll_attempts < max_attempts:
                 if stop_event.is_set():
                     break
+
+                # ── Method 1: From intercepted API calls ──────────────────
+                pending_ids = []
                 for url in list(api_urls):
+                    if url.startswith("__ID__"):
+                        pending_ids.append(url[6:])
+                        continue
                     clean = url.split("?")[0]
-                    if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
+                    if clean not in seen and TIKTOK_VIDEO_PATTERN.match(clean):
                         seen.add(clean)
-                        collected.append({"index": len(collected)+1, "url": clean, "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
-                        on_progress(len(collected), target)
+                        collected.append({
+                            "index": len(collected) + 1,
+                            "url": clean,
+                            "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        })
+                        if len(collected) % 10 == 0 or len(collected) == target:
+                            on_progress(len(collected), target)
                         if len(collected) >= target:
                             break
                 api_urls.clear()
-                if len(collected) < target:
-                    for url in TIKTOK_VIDEO_RE.findall(page.content()):
-                        clean = url.split("?")[0]
+
+                # Resolve any bare video IDs by finding them in page HTML
+                if pending_ids:
+                    page_html_for_ids = page.content()
+                    for vid_id in pending_ids:
+                        # Find the matching full URL in page source
+                        import re as _re
+                        pattern = r'https://www\.tiktok\.com/@([\w\.]+)/video/' + vid_id
+                        match = _re.search(pattern,
+                            page_html_for_ids
+                        )
+                        if match:
+                            clean = f"https://www.tiktok.com/@{match.group(1)}/video/{vid_id}"
+                        else:
+                            # Last resort: use the video ID with a placeholder we can note
+                            clean = f"https://www.tiktok.com/video/{vid_id}"
                         if clean not in seen:
                             seen.add(clean)
-                            collected.append({"index": len(collected)+1, "url": clean, "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
+                            collected.append({
+                                "index": len(collected) + 1,
+                                "url": clean,
+                                "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            })
+                            if len(collected) % 10 == 0 or len(collected) == target:
+                                on_progress(len(collected), target)
+
+                # ── Method 2: Scan page HTML ──────────────────────────────
+                page_html = page.content()
+                for url in TIKTOK_VIDEO_PATTERN.findall(page_html):
+                    clean = url.split("?")[0]
+                    if clean not in seen:
+                        seen.add(clean)
+                        collected.append({
+                            "index": len(collected) + 1,
+                            "url": clean,
+                            "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        })
+                        if len(collected) % 10 == 0 or len(collected) == target:
                             on_progress(len(collected), target)
+                        if len(collected) >= target:
+                            break
+
+                # ── Method 3: Anchor tags ──────────────────────────────────
+                try:
+                    links = page.eval_on_selector_all(
+                        "a[href*='/video/']",
+                        "els => els.map(e => e.href)"
+                    )
+                    for url in links:
+                        clean = url.split("?")[0]
+                        if clean not in seen and TIKTOK_VIDEO_PATTERN.match(clean):
+                            seen.add(clean)
+                            collected.append({
+                                "index": len(collected) + 1,
+                                "url": clean,
+                                "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            })
+                            if len(collected) % 10 == 0 or len(collected) == target:
+                                on_progress(len(collected), target)
                             if len(collected) >= target:
                                 break
-                if len(collected) >= target:
-                    break
-                stuck = 0 if len(collected) > last_count else stuck + 1
-                last_count = len(collected)
-                page.mouse.click(640, 450)
-                time.sleep(0.3)
-                page.keyboard.press("ArrowDown")
-                time.sleep(2)
-                page.evaluate("window.scrollBy(0, 600)")
-                time.sleep(1)
-                scroll_attempts += 1
-                if stuck >= 5:
-                    try:
-                        page.mouse.click(640, 450)
-                        time.sleep(1)
-                    except Exception:
-                        pass
-                    stuck = 0
-            if not collected:
-                try:
-                    page.screenshot(path="/tmp/debug.png")
                 except Exception:
                     pass
+
+                # Detect if stuck
+                if len(collected) == last_count:
+                    stuck_count += 1
+                else:
+                    stuck_count = 0
+                last_count = len(collected)
+
+                # TikTok FYP is a vertical video player - use arrow key like a real user
+                try:
+                    # Click center of page first to make sure it has focus
+                    if scroll_attempts == 0:
+                        page.mouse.click(640, 450)
+                        time.sleep(1)
+                    # Press down arrow to go to next video
+                    page.keyboard.press("ArrowDown")
+                except Exception:
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
+
+                time.sleep(max(pause, 3.0))  # wait for next video to load
+
+                # Every 10 videos also do a scroll just in case
+                if scroll_attempts % 10 == 0:
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    time.sleep(1)
+
+                # If stuck for 15 attempts, try clicking the down arrow button on screen
+                if stuck_count == 15:
+                    logger.warning(f"Stuck at {len(collected)} results after {scroll_attempts} scrolls")
+                    try:
+                        # Try the on-screen next video button
+                        page.click("[data-e2e='arrow-down'], [class*='ButtonDown'], .swiper-button-next", timeout=2000)
+                        time.sleep(2)
+                    except Exception:
+                        pass
+
+                scroll_attempts += 1
+
+            # Debug screenshot if 0 results
+            if not collected:
+                try:
+                    page.screenshot(path="/tmp/tiktok_debug.png", full_page=False)
+                    logger.warning("0 results — screenshot saved to /tmp/tiktok_debug.png — use /debug command")
+                except Exception:
+                    pass
+
             browser.close()
+
         user_state[user_id]["results"] = collected
         on_done(collected)
+
     except Exception as e:
         logger.exception("Scraper error")
         on_error(str(e))
 
-@auth_required
-async def cmd_start(update, ctx):
-    await update.message.reply_text(
-        "🎵 *TikTok FYP Scraper*\n\n"
-        "*Setup:*\n"
-        "/setcookies — Paste your TikTok cookies JSON\n"
-        "/cookies — Check current session status\n"
-        "/cookiehelp — How to export cookies from browser\n\n"
-        "*Scraping:*\n"
-        "/scrape `<amount>` — e.g. /scrape 20\n"
-        "/stop — Stop current scrape\n"
-        "/status — Check progress\n\n"
-        "*Output:*\n"
-        "/format — Switch CSV or TXT\n"
-        "/download — Download results\n\n"
-        "*Debug:*\n"
-        "/debug — Screenshot what the bot sees",
-        parse_mode="Markdown"
-    )
+
+# ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 
 @auth_required
-async def cmd_help(update, ctx):
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.first_name
+    text = (
+        f"👋 Welcome, *{uid}*!\n\n"
+        "🎵 *TikTok FYP Scraper Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "Use the commands below to control the scraper:\n\n"
+        "▶️ /scrape — Start scraping\n"
+        "⏹ /stop — Stop current scrape\n"
+        "⚙️ /settings — View & change settings\n"
+        "📥 /download — Download last results\n"
+        "📊 /status — Check scraper status\n"
+        "❓ /help — Show this message\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, ctx)
 
-def _apply_cookies(cookies, err, has_warning=False):
-    """Store cookies and return (success, status_text)."""
-    if err and not cookies:
-        return False, f"❌ *Failed:*\n`{err}`"
-    with _runtime_cookies_lock:
-        _runtime_cookies.clear()
-        _runtime_cookies.extend(cookies)
-    names = [c["name"] for c in cookies]
-    has_session = "sessionid" in names
-    session_preview = next((c["value"][:10] + "..." for c in cookies if c["name"] == "sessionid"), "not found")
-    icon = "✅" if has_session else "⚠️"
-    warning = "\n\n⚠️ No `sessionid` found — may not be logged in." if not has_session else ""
-    text = (
-        f"{icon} *Cookies loaded!*\n\n"
-        f"Total: `{len(cookies)}` cookies\n"
-        f"Names: `{', '.join(names[:12])}{'...' if len(names)>12 else ''}`\n"
-        f"sessionid: `{session_preview}`{warning}\n\n"
-        "Run /debug to verify TikTok loads correctly."
-    )
-    return True, text
 
 @auth_required
-async def cmd_setcookies(update, ctx):
-    args_text = update.message.text.partition(" ")[2].strip()
-    if not args_text:
-        await update.message.reply_text(
-            "📋 *How to set cookies:*\n\n"
-            "*Option 1 — Upload JSON file (easiest, no size limit):*\n"
-            "1. Install *EditThisCookie* or *Cookie-Editor* in Chrome\n"
-            "2. Go to tiktok.com and log in\n"
-            "3. Click extension → Export as JSON\n"
-            "4. Save the JSON to a file (e.g. `cookies.json`)\n"
-            "5. Send the file here as a document 📎\n\n"
-            "*Option 2 — Paste JSON array:*\n"
-            "1. Export cookies as JSON (see Option 1)\n"
-            "2. Send: `/setcookies [paste JSON here]`\n\n"
-            "*Option 3 — Raw sessionid only:*\n"
-            "1. tiktok.com → F12 → Application → Cookies\n"
-            "2. Copy value of `sessionid`\n"
-            "3. Send: `/setcookies abc123yourvalue`\n\n"
-            "*Option 4 — Use Railway env vars:*\n"
-            "1. Go to your Railway project → Variables\n"
-            "2. Add `TIKTOK_COOKIES_JSON` (full JSON)\n"
-            "3. Or add `TIKTOK_SESSIONID` (just sessionid)\n"
-            "4. Deploy and use /cookies to verify\n\n"
-            "Use /cookiehelp for full guide.",
-            parse_mode="Markdown"
-        )
-        return
-    cookies, err = parse_cookies(args_text)
-    ok, text = _apply_cookies(cookies, err)
-    if not ok:
-        text += "\n\nUse /setcookies (no args) for instructions."
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# ─── COOKIE FILE UPLOAD HANDLER ───────────────────────────────────────────────
-@auth_required
-async def handle_cookie_file(update, ctx):
-    """Accept a .json file sent as a document and load it as cookies."""
-    doc = update.message.document
-    fname = doc.file_name or ""
-
-    # Only handle .json files
-    if not fname.lower().endswith(".json"):
-        await update.message.reply_text(
-            "📎 File received but it's not a `.json` file.\n"
-            "Please export your cookies as JSON and send the `.json` file.",
-            parse_mode="Markdown"
-        )
-        return
-
-    await update.message.reply_text("⏳ Reading cookie file...")
-
-    try:
-        tg_file = await ctx.bot.get_file(doc.file_id)
-        raw_bytes = await tg_file.download_as_bytearray()
-        raw_text = raw_bytes.decode("utf-8").strip()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to download file: {e}")
-        return
-
-    cookies, err = parse_cookies(raw_text)
-    ok, text = _apply_cookies(cookies, err)
-    if not ok:
-        text += "\n\nMake sure the file contains a valid JSON cookie array."
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-@auth_required
-async def cmd_cookiehelp(update, ctx):
-    await update.message.reply_text(
-        "🍪 *Cookie Export Guide*\n\n"
-        "*EditThisCookie (Chrome):*\n"
-        "1. Chrome Web Store → install 'EditThisCookie'\n"
-        "2. Go to tiktok.com and log in\n"
-        "3. Click the extension icon\n"
-        "4. Click Export (box with arrow icon)\n"
-        "5. JSON is copied to clipboard\n"
-        "6. Send: `/setcookies [paste here]`\n\n"
-        "*Cookie-Editor (Chrome/Firefox):*\n"
-        "1. Install Cookie-Editor extension\n"
-        "2. Go to tiktok.com while logged in\n"
-        "3. Extension icon → Export → Export as JSON\n"
-        "4. Send: `/setcookies [paste here]`\n\n"
-        "*Tips:*\n"
-        "• Must be logged in when exporting\n"
-        "• Cookies expire every ~60 days\n"
-        "• Re-export if scraping stops working",
-        parse_mode="Markdown"
-    )
-
-@auth_required
-async def cmd_cookies(update, ctx):
-    cookies = get_active_cookies()
-    if not cookies:
-        await update.message.reply_text(
-            "❌ *No cookies loaded.*\n\n"
-            "*Options:*\n"
-            "1. `/setcookies` — Add via Telegram\n"
-            "2. Railway → Variables → Add `TIKTOK_COOKIES_JSON` or `TIKTOK_SESSIONID`\n"
-            "3. Use /cookiehelp for export instructions",
-            parse_mode="Markdown"
-        )
-        return
-    names = [c["name"] for c in cookies]
-    session_preview = next((c["value"][:12]+"..." for c in cookies if c["name"]=="sessionid"), "missing")
-
-    # Determine source
-    source_list = []
-    if _runtime_cookies:
-        source_list.append("runtime (/setcookies)")
-    if TIKTOK_COOKIES_JSON:
-        source_list.append("Railway env (TIKTOK_COOKIES_JSON)")
-    if TIKTOK_SESSIONID:
-        source_list.append("Railway env (TIKTOK_SESSIONID)")
-    if TIKTOK_SESSION:
-        source_list.append("Railway env (TIKTOK_SESSION)")
-
-    source = " + ".join(source_list) if source_list else "unknown"
-
-    await update.message.reply_text(
-        "🍪 *Cookie Status*\n\n"
-        f"Source: `{source}`\n"
-        f"Total: `{len(cookies)}` cookies\n\n"
-        f"sessionid:     {'✅' if 'sessionid' in names else '❌'} `{session_preview}`\n"
-        f"sid_tt:        {'✅' if 'sid_tt' in names else '❌ missing'}\n"
-        f"tt_csrf_token: {'✅' if 'tt_csrf_token' in names else '⚠️ optional'}\n\n"
-        f"All names:\n`{', '.join(names)}`\n\n"
-        "Run /debug to verify.",
-        parse_mode="Markdown"
-    )
-
-@auth_required
-async def cmd_scrape(update, ctx):
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state[uid]
     if state["running"]:
-        await update.message.reply_text("Already running! Use /stop first.")
+        count = len(state["results"])
+        target = state["target"]
+        pct = int(count / target * 100) if target else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        msg = (
+            f"🟢 *Scraper is running*\n\n"
+            f"Progress: `{bar}` {pct}%\n"
+            f"Collected: {count} / {target} videos\n\n"
+            f"Use /stop to halt."
+        )
+    else:
+        count = len(state["results"])
+        msg = (
+            f"⚪ *Scraper is idle*\n\n"
+            f"Last run collected: {count} videos\n"
+            f"Use /scrape to start a new run."
+        )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = user_state[uid]
+    keyboard = [
+        [
+            InlineKeyboardButton("🎯 Target: 25",  callback_data="set_target_25"),
+            InlineKeyboardButton("🎯 Target: 50",  callback_data="set_target_50"),
+            InlineKeyboardButton("🎯 Target: 100", callback_data="set_target_100"),
+        ],
+        [
+            InlineKeyboardButton("⏱ Pause: 1.5s", callback_data="set_pause_1.5"),
+            InlineKeyboardButton("⏱ Pause: 2.5s", callback_data="set_pause_2.5"),
+            InlineKeyboardButton("⏱ Pause: 4s",   callback_data="set_pause_4"),
+        ],
+        [
+            InlineKeyboardButton("📄 Format: CSV",  callback_data="set_fmt_csv"),
+            InlineKeyboardButton("📄 Format: TXT",  callback_data="set_fmt_txt"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = (
+        f"⚙️ *Settings*\n\n"
+        f"• Target videos: `{state['target']}`\n"
+        f"• Scroll pause: `{state['pause']}s`\n"
+        f"• Output format: `{state.get('fmt', 'csv').upper()}`\n\n"
+        f"Tap a button to change:"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+
+
+@auth_required
+async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = user_state[uid]
+
+    if state["running"]:
+        await update.message.reply_text(
+            "⚠️ Scraper is already running! Use /stop to halt it first."
+        )
         return
-    if not get_active_cookies():
-        await update.message.reply_text("⚠️ No cookies! Use /setcookies first.")
-        return
-    args = ctx.args
-    try:
-        target = max(1, min(500, int(args[0]))) if args else 20
-    except (ValueError, IndexError):
-        await update.message.reply_text("Usage: /scrape <amount>\nExample: /scrape 30")
-        return
+
+    target = state["target"]
+    pause = state["pause"]
+
     state["running"] = True
     state["results"] = []
     stop_event = threading.Event()
     state["stop_event"] = stop_event
-    status_msg = await update.message.reply_text("🔄 Scraping 0/" + str(target) + " videos...")
-    state["status_msg_id"] = status_msg.message_id
+
+    await update.message.reply_text(
+        f"🚀 *Scraper started!*\n\n"
+        f"🎯 Target: {target} videos\n"
+        f"⏱ Scroll pause: {pause}s\n\n"
+        f"I'll update you every 10 videos. Use /stop to cancel.",
+        parse_mode="Markdown"
+    )
+
     loop = asyncio.get_event_loop()
+
     def on_progress(count, total):
-        asyncio.run_coroutine_threadsafe(ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text="🔄 Scraping " + str(count) + "/" + str(total) + " videos..."), loop)
+        asyncio.run_coroutine_threadsafe(
+            ctx.bot.send_message(
+                chat_id=uid,
+                text=f"📊 Progress: *{count}/{total}* videos collected...",
+                parse_mode="Markdown",
+            ),
+            loop,
+        )
+
     def on_done(results):
         state["running"] = False
-        asyncio.run_coroutine_threadsafe(ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text="✅ Done! Collected " + str(len(results)) + "/" + str(target) + " videos.\nUse /download to get the file."), loop)
+        asyncio.run_coroutine_threadsafe(
+            ctx.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"✅ *Scrape complete!*\n\n"
+                    f"Collected *{len(results)}* video links.\n"
+                    f"Use /download to get the file."
+                ),
+                parse_mode="Markdown",
+            ),
+            loop,
+        )
+
     def on_error(err):
         state["running"] = False
-        asyncio.run_coroutine_threadsafe(ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text="❌ Error: " + str(err) + "\n\nTry /debug."), loop)
-    threading.Thread(target=run_scraper, args=(uid, target, stop_event, on_progress, on_done, on_error), daemon=True).start()
+        asyncio.run_coroutine_threadsafe(
+            ctx.bot.send_message(
+                chat_id=uid,
+                text=f"❌ *Scraper error:*\n`{err}`",
+                parse_mode="Markdown",
+            ),
+            loop,
+        )
+
+    t = threading.Thread(
+        target=run_scraper,
+        args=(uid, target, pause, stop_event, on_progress, on_done, on_error),
+        daemon=True,
+    )
+    state["thread"] = t
+    t.start()
+
 
 @auth_required
-async def cmd_stop(update, ctx):
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state[uid]
+
     if not state["running"]:
-        await update.message.reply_text("Nothing is running.")
+        await update.message.reply_text("ℹ️ No scraper is currently running.")
         return
-    state["stop_event"].set()
+
+    if state["stop_event"]:
+        state["stop_event"].set()
+
     state["running"] = False
     count = len(state["results"])
-    if state.get("status_msg_id"):
-        try:
-            await ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text="⏹ Stopped at " + str(count) + " videos. Use /download to get them.")
-            return
-        except Exception:
-            pass
-    await update.message.reply_text("Stopped. Collected " + str(count) + " videos.")
+    await update.message.reply_text(
+        f"⏹ *Scraper stopped.*\n\n"
+        f"Collected {count} videos so far.\n"
+        f"Use /download to grab the partial results.",
+        parse_mode="Markdown"
+    )
+
 
 @auth_required
-async def cmd_status(update, ctx):
+async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state[uid]
-    if state["running"]:
-        await update.message.reply_text("Running — " + str(len(state["results"])) + " videos so far.")
-    else:
-        await update.message.reply_text("Idle — last run: " + str(len(state["results"])) + " videos.")
+    results = state["results"]
 
-@auth_required
-async def cmd_format(update, ctx):
-    uid = update.effective_user.id
-    keyboard = [[InlineKeyboardButton("CSV", callback_data="fmt_csv"), InlineKeyboardButton("TXT", callback_data="fmt_txt")]]
-    await update.message.reply_text("Current: " + user_state[uid]["fmt"].upper() + "\nChoose output:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-@auth_required
-async def cmd_download(update, ctx):
-    uid = update.effective_user.id
-    results = user_state[uid]["results"]
     if not results:
-        await update.message.reply_text("No results yet. Run /scrape first.")
+        await update.message.reply_text(
+            "📭 No results yet. Run /scrape first!"
+        )
         return
-    fmt = user_state[uid]["fmt"]
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    fmt = state.get("fmt", "csv")
+
     if fmt == "csv":
         buf = StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["index","url","scraped_at"])
+        writer = csv.DictWriter(buf, fieldnames=["index", "url", "scraped_at"])
         writer.writeheader()
         writer.writerows(results)
-        await update.message.reply_document(document=buf.getvalue().encode(), filename="tiktok_"+ts+".csv", caption=str(len(results))+" TikTok links")
+        buf.seek(0)
+        filename = f"tiktok_fyp_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+        await update.message.reply_document(
+            document=buf.getvalue().encode("utf-8"),
+            filename=filename,
+            caption=f"🎵 {len(results)} TikTok video links — CSV format",
+        )
     else:
         content = "\n".join(r["url"] for r in results)
-        await update.message.reply_document(document=content.encode(), filename="tiktok_"+ts+".txt", caption=str(len(results))+" TikTok links")
+        filename = f"tiktok_fyp_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+        await update.message.reply_document(
+            document=content.encode("utf-8"),
+            filename=filename,
+            caption=f"🎵 {len(results)} TikTok video links — TXT format",
+        )
 
+
+# ─── INLINE KEYBOARD CALLBACKS ────────────────────────────────────────────────
 @auth_required
-async def cmd_debug(update, ctx):
-    uid = update.effective_user.id
-    cookies = get_active_cookies()
-    await update.message.reply_text("📸 Taking screenshot (~15s)...\nCookies: " + str(len(cookies)))
-    loop = asyncio.get_event_loop()
-    def _run():
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"])
-                context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36", viewport={"width":1280,"height":900})
-                context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-                if cookies:
-                    context.add_cookies(cookies)
-                page = context.new_page()
-                page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=30000)
-                time.sleep(6)
-                page.screenshot(path="/tmp/debug.png")
-                final_url = page.url
-                browser.close()
-            caption = "✅ FYP loaded — cookies working!" if "foryou" in final_url else "⚠️ Login wall detected. Re-export cookies with /cookiehelp."
-            with open("/tmp/debug.png","rb") as f:
-                asyncio.run_coroutine_threadsafe(ctx.bot.send_photo(chat_id=uid, photo=f, caption=caption), loop)
-        except Exception as e:
-            asyncio.run_coroutine_threadsafe(ctx.bot.send_message(chat_id=uid, text="Screenshot failed: "+str(e)), loop)
-    threading.Thread(target=_run, daemon=True).start()
+async def cmd_cookiestatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show whether TikTok cookies are loaded."""
+    if TIKTOK_COOKIES:
+        names = [c.get("name", "?") for c in TIKTOK_COOKIES[:8]]
+        await update.message.reply_text(
+            f"🍪 *Cookies loaded:* {len(TIKTOK_COOKIES)} cookies\n"
+            f"Keys: `{', '.join(names)}{'...' if len(TIKTOK_COOKIES) > 8 else ''}`\n\n"
+            f"✅ Bot will log in automatically when scraping.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ *No cookies loaded.*\n\n"
+            "Scraper will run without login — TikTok may show a login wall.\n\n"
+            "To add cookies:\n"
+            "1️⃣ Log into tiktok.com in Chrome\n"
+            "2️⃣ Install *Cookie-Editor* extension\n"
+            "3️⃣ Export as JSON\n"
+            "4️⃣ Add `TIKTOK_COOKIES` env var in Railway with the JSON value\n"
+            "5️⃣ Redeploy",
+            parse_mode="Markdown"
+        )
 
-async def button_handler(update, ctx):
+
+async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
     await query.answer()
+
     if not is_allowed(uid):
         return
-    if query.data == "fmt_csv":
-        user_state[uid]["fmt"] = "csv"
-        await query.edit_message_text("Output format set to CSV.")
-    elif query.data == "fmt_txt":
-        user_state[uid]["fmt"] = "txt"
-        await query.edit_message_text("Output format set to TXT.")
 
-async def unknown(update, ctx):
-    await update.message.reply_text("Unknown command. Use /help.")
+    data = query.data
+    state = user_state[uid]
 
+    if data.startswith("set_target_"):
+        val = int(data.split("_")[-1])
+        state["target"] = val
+        await query.edit_message_text(f"✅ Target set to *{val}* videos.", parse_mode="Markdown")
+
+    elif data.startswith("set_pause_"):
+        val = float(data.split("_")[-1])
+        state["pause"] = val
+        await query.edit_message_text(f"✅ Scroll pause set to *{val}s*.", parse_mode="Markdown")
+
+    elif data.startswith("set_fmt_"):
+        val = data.split("_")[-1]
+        state["fmt"] = val
+        await query.edit_message_text(f"✅ Output format set to *{val.upper()}*.", parse_mode="Markdown")
+
+
+@auth_required
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Take a screenshot of what TikTok shows the bot and send it."""
+    uid = update.effective_user.id
+    await update.message.reply_text("📸 Taking a screenshot of TikTok... please wait ~15s")
+
+    def take_screenshot():
+        try:
+            from playwright.sync_api import sync_playwright
+            import base64
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 900},
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+                if TIKTOK_COOKIES:
+                    context.add_cookies(TIKTOK_COOKIES)
+                page = context.new_page()
+                page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=30_000)
+                import time
+                time.sleep(5)
+                path = "/tmp/tiktok_debug.png"
+                page.screenshot(path=path, full_page=False)
+                browser.close()
+            return path
+        except Exception as e:
+            return str(e)
+
+    loop = asyncio.get_event_loop()
+
+    def run():
+        result = take_screenshot()
+        async def send():
+            if result.endswith(".png"):
+                with open(result, "rb") as f:
+                    await ctx.bot.send_photo(
+                        chat_id=uid,
+                        photo=f,
+                        caption="🖥 This is what TikTok shows the scraper. If you see a login wall or CAPTCHA, cookies may have expired."
+                    )
+            else:
+                await ctx.bot.send_message(chat_id=uid, text=f"❌ Screenshot failed: {result}")
+        asyncio.run_coroutine_threadsafe(send(), loop)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ─── UNKNOWN COMMAND ──────────────────────────────────────────────────────────
+async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "❓ Unknown command. Use /help to see available commands."
+    )
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("help",       cmd_help))
-    app.add_handler(CommandHandler("setcookies", cmd_setcookies))
-    app.add_handler(CommandHandler("cookiehelp", cmd_cookiehelp))
-    app.add_handler(CommandHandler("cookies",    cmd_cookies))
-    app.add_handler(CommandHandler("scrape",     cmd_scrape))
-    app.add_handler(CommandHandler("stop",       cmd_stop))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("format",     cmd_format))
-    app.add_handler(CommandHandler("download",   cmd_download))
-    app.add_handler(CommandHandler("debug",      cmd_debug))
+
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("scrape",   cmd_scrape))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("download", cmd_download))
+    app.add_handler(CommandHandler("cookies",  cmd_cookiestatus))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
     app.add_handler(CallbackQueryHandler(button_handler))
-    # Accept .json file uploads as cookies (no size limit)
-    app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), handle_cookie_file))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_cookie_file))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
-    logger.info("Bot started!")
+
+    logger.info("Bot is running...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

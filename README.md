@@ -52,36 +52,12 @@ In your Railway project → **Variables** tab, add:
 | Variable | Value | Required |
 |---|---|---|
 | `TELEGRAM_TOKEN` | Your bot token from BotFather | ✅ |
-| `ALLOWED_USERS` | Your Telegram user ID(s), comma-separated | Optional |
-| `TIKTOK_COOKIES_JSON` | Full JSON cookie array from browser export | Optional* |
-| `TIKTOK_SESSIONID` | Just the `sessionid` cookie value | Optional* |
+| `ALLOWED_USERS` | Your Telegram user ID(s), comma-separated | Optional (leave blank = open to all) |
 
-*At least one cookie option should be set for the bot to work.
-
-#### 🍪 Cookie Setup Options
-
-**Option A: Full JSON (Recommended)**
-1. Export your TikTok cookies as JSON from Chrome/Firefox (see /cookiehelp in bot)
-2. In Railway Variables, add:
-   ```
-   TIKTOK_COOKIES_JSON=[{"name":"sessionid","value":"..."},{"name":"sid_tt","value":"..."}]
-   ```
-
-**Option B: Just SessionID**
-1. Get your TikTok sessionid from browser DevTools
-2. In Railway Variables, add:
-   ```
-   TIKTOK_SESSIONID=your_sessionid_value_here
-   ```
-
-**Option C: Runtime (via Telegram)**
-- Use `/setcookies` in Telegram to upload cookies without modifying Railway variables
-
-Example Railway variables:
+Example:
 ```
 TELEGRAM_TOKEN=123456:ABC-DEFxxxxx
-ALLOWED_USERS=987654321
-TIKTOK_SESSIONID=xxxxxxx_your_sessionid_xxxxxxx
+ALLOWED_USERS=987654321,111222333
 ```
 
 ### Step 6 — Deploy!
@@ -97,30 +73,13 @@ Railway will build and deploy automatically. Once live, open Telegram and send `
 pip install -r requirements.txt
 playwright install chromium
 
-# Set env vars (example with Railway Cookie JSON)
+# Set env vars
 export TELEGRAM_TOKEN=your_token_here
 export ALLOWED_USERS=your_user_id
-export TIKTOK_COOKIES_JSON='[{"name":"sessionid","value":"your_value_here"}]'
-
-# Or just use sessionid
-export TIKTOK_SESSIONID=your_sessionid_here
 
 # Run
 python bot.py
 ```
-
----
-
-## 📝 Cookie Refresh Guide
-
-TikTok cookies expire after ~60 days. To refresh:
-
-1. Go to [tiktok.com](https://tiktok.com) and log in
-2. Export cookies again (see /cookiehelp in bot for step-by-step)
-3. **Option A**: Send to bot via `/setcookies` (persists until next restart)
-4. **Option B**: Update Railway Variables with new cookie value and redeploy
-
-The bot will auto-load cookies from Railway variables on startup.
 
 ---
 
