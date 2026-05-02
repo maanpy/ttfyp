@@ -22,6 +22,10 @@ ALLOWED_USERS_RAW = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS     = set(int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip())
 TIKTOK_SESSION    = os.environ.get("TIKTOK_SESSION", "").strip()
 
+# Support multiple cookie sources from Railway
+TIKTOK_COOKIES_JSON = os.environ.get("TIKTOK_COOKIES_JSON", "").strip()  # Full JSON array
+TIKTOK_SESSIONID    = os.environ.get("TIKTOK_SESSIONID", "").strip()      # Just sessionid value
+
 _runtime_cookies = []
 _runtime_cookies_lock = threading.Lock()
 
@@ -88,12 +92,29 @@ def parse_cookies(raw):
     return [], "Unrecognized format. Use /setcookies for instructions."
 
 def get_active_cookies():
+    """Get cookies from runtime, then fallback to Railway env vars."""
     with _runtime_cookies_lock:
         if _runtime_cookies:
             return list(_runtime_cookies)
+
+    # Try full JSON from Railway first
+    if TIKTOK_COOKIES_JSON:
+        cookies, _ = parse_cookies(TIKTOK_COOKIES_JSON)
+        if cookies:
+            return cookies
+
+    # Fallback to old TIKTOK_SESSION format
     if TIKTOK_SESSION:
         cookies, _ = parse_cookies(TIKTOK_SESSION)
-        return cookies
+        if cookies:
+            return cookies
+
+    # Last resort: just sessionid
+    if TIKTOK_SESSIONID:
+        cookies, _ = parse_cookies(TIKTOK_SESSIONID)
+        if cookies:
+            return cookies
+
     return []
 
 def is_allowed(uid):
@@ -288,10 +309,18 @@ async def cmd_setcookies(update, ctx):
             "3. Click extension → Export as JSON\n"
             "4. Save the JSON to a file (e.g. `cookies.json`)\n"
             "5. Send the file here as a document 📎\n\n"
-            "*Option 2 — Raw sessionid only:*\n"
+            "*Option 2 — Paste JSON array:*\n"
+            "1. Export cookies as JSON (see Option 1)\n"
+            "2. Send: `/setcookies [paste JSON here]`\n\n"
+            "*Option 3 — Raw sessionid only:*\n"
             "1. tiktok.com → F12 → Application → Cookies\n"
             "2. Copy value of `sessionid`\n"
             "3. Send: `/setcookies abc123yourvalue`\n\n"
+            "*Option 4 — Use Railway env vars:*\n"
+            "1. Go to your Railway project → Variables\n"
+            "2. Add `TIKTOK_COOKIES_JSON` (full JSON)\n"
+            "3. Or add `TIKTOK_SESSIONID` (just sessionid)\n"
+            "4. Deploy and use /cookies to verify\n\n"
             "Use /cookiehelp for full guide.",
             parse_mode="Markdown"
         )
@@ -362,13 +391,30 @@ async def cmd_cookies(update, ctx):
     cookies = get_active_cookies()
     if not cookies:
         await update.message.reply_text(
-            "❌ *No cookies loaded.*\n\nUse /setcookies to add cookies.\nUse /cookiehelp for help.",
+            "❌ *No cookies loaded.*\n\n"
+            "*Options:*\n"
+            "1. `/setcookies` — Add via Telegram\n"
+            "2. Railway → Variables → Add `TIKTOK_COOKIES_JSON` or `TIKTOK_SESSIONID`\n"
+            "3. Use /cookiehelp for export instructions",
             parse_mode="Markdown"
         )
         return
     names = [c["name"] for c in cookies]
     session_preview = next((c["value"][:12]+"..." for c in cookies if c["name"]=="sessionid"), "missing")
-    source = "runtime (/setcookies)" if _runtime_cookies else "env var (TIKTOK_SESSION)"
+
+    # Determine source
+    source_list = []
+    if _runtime_cookies:
+        source_list.append("runtime (/setcookies)")
+    if TIKTOK_COOKIES_JSON:
+        source_list.append("Railway env (TIKTOK_COOKIES_JSON)")
+    if TIKTOK_SESSIONID:
+        source_list.append("Railway env (TIKTOK_SESSIONID)")
+    if TIKTOK_SESSION:
+        source_list.append("Railway env (TIKTOK_SESSION)")
+
+    source = " + ".join(source_list) if source_list else "unknown"
+
     await update.message.reply_text(
         "🍪 *Cookie Status*\n\n"
         f"Source: `{source}`\n"
