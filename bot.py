@@ -255,18 +255,39 @@ async def cmd_start(update, ctx):
 async def cmd_help(update, ctx):
     await cmd_start(update, ctx)
 
+def _apply_cookies(cookies, err, has_warning=False):
+    """Store cookies and return (success, status_text)."""
+    if err and not cookies:
+        return False, f"❌ *Failed:*\n`{err}`"
+    with _runtime_cookies_lock:
+        _runtime_cookies.clear()
+        _runtime_cookies.extend(cookies)
+    names = [c["name"] for c in cookies]
+    has_session = "sessionid" in names
+    session_preview = next((c["value"][:10] + "..." for c in cookies if c["name"] == "sessionid"), "not found")
+    icon = "✅" if has_session else "⚠️"
+    warning = "\n\n⚠️ No `sessionid` found — may not be logged in." if not has_session else ""
+    text = (
+        f"{icon} *Cookies loaded!*\n\n"
+        f"Total: `{len(cookies)}` cookies\n"
+        f"Names: `{', '.join(names[:12])}{'...' if len(names)>12 else ''}`\n"
+        f"sessionid: `{session_preview}`{warning}\n\n"
+        "Run /debug to verify TikTok loads correctly."
+    )
+    return True, text
+
 @auth_required
 async def cmd_setcookies(update, ctx):
     args_text = update.message.text.partition(" ")[2].strip()
     if not args_text:
         await update.message.reply_text(
-            "📋 *How to use /setcookies:*\n\n"
-            "*Option 1 — Full JSON (recommended):*\n"
+            "📋 *How to set cookies:*\n\n"
+            "*Option 1 — Upload JSON file (easiest, no size limit):*\n"
             "1. Install *EditThisCookie* or *Cookie-Editor* in Chrome\n"
             "2. Go to tiktok.com and log in\n"
             "3. Click extension → Export as JSON\n"
-            "4. Copy the full JSON array\n"
-            "5. Send: `/setcookies [paste json here]`\n\n"
+            "4. Save the JSON to a file (e.g. `cookies.json`)\n"
+            "5. Send the file here as a document 📎\n\n"
             "*Option 2 — Raw sessionid only:*\n"
             "1. tiktok.com → F12 → Application → Cookies\n"
             "2. Copy value of `sessionid`\n"
@@ -276,28 +297,42 @@ async def cmd_setcookies(update, ctx):
         )
         return
     cookies, err = parse_cookies(args_text)
-    if err and not cookies:
+    ok, text = _apply_cookies(cookies, err)
+    if not ok:
+        text += "\n\nUse /setcookies (no args) for instructions."
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ─── COOKIE FILE UPLOAD HANDLER ───────────────────────────────────────────────
+@auth_required
+async def handle_cookie_file(update, ctx):
+    """Accept a .json file sent as a document and load it as cookies."""
+    doc = update.message.document
+    fname = doc.file_name or ""
+
+    # Only handle .json files
+    if not fname.lower().endswith(".json"):
         await update.message.reply_text(
-            f"❌ *Failed:*\n`{err}`\n\nUse /setcookies (no args) for instructions.",
+            "📎 File received but it's not a `.json` file.\n"
+            "Please export your cookies as JSON and send the `.json` file.",
             parse_mode="Markdown"
         )
         return
-    with _runtime_cookies_lock:
-        _runtime_cookies.clear()
-        _runtime_cookies.extend(cookies)
-    names = [c["name"] for c in cookies]
-    has_session = "sessionid" in names
-    session_preview = next((c["value"][:10] + "..." for c in cookies if c["name"] == "sessionid"), "not found")
-    icon = "✅" if has_session else "⚠️"
-    warning = "\n\n⚠️ No `sessionid` found — may not be logged in." if not has_session else ""
-    await update.message.reply_text(
-        f"{icon} *Cookies loaded!*\n\n"
-        f"Total: `{len(cookies)}` cookies\n"
-        f"Names: `{', '.join(names[:12])}{'...' if len(names)>12 else ''}`\n"
-        f"sessionid: `{session_preview}`{warning}\n\n"
-        "Run /debug to verify TikTok loads correctly.",
-        parse_mode="Markdown"
-    )
+
+    await update.message.reply_text("⏳ Reading cookie file...")
+
+    try:
+        tg_file = await ctx.bot.get_file(doc.file_id)
+        raw_bytes = await tg_file.download_as_bytearray()
+        raw_text = raw_bytes.decode("utf-8").strip()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to download file: {e}")
+        return
+
+    cookies, err = parse_cookies(raw_text)
+    ok, text = _apply_cookies(cookies, err)
+    if not ok:
+        text += "\n\nMake sure the file contains a valid JSON cookie array."
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 @auth_required
 async def cmd_cookiehelp(update, ctx):
@@ -489,6 +524,9 @@ def main():
     app.add_handler(CommandHandler("download",   cmd_download))
     app.add_handler(CommandHandler("debug",      cmd_debug))
     app.add_handler(CallbackQueryHandler(button_handler))
+    # Accept .json file uploads as cookies (no size limit)
+    app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), handle_cookie_file))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_cookie_file))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
     logger.info("Bot started!")
     app.run_polling(drop_pending_updates=True)
