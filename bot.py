@@ -4,7 +4,7 @@ TikTok FYP Scraper Bot
 - Or send a .json cookie file directly to the bot -> it replies with the Railway value
 """
 
-import os, csv, re, time, asyncio, logging, threading, json
+import os, csv, re, time, asyncio, logging, threading, json, tempfile
 from io import StringIO
 from datetime import datetime
 from collections import defaultdict
@@ -27,7 +27,7 @@ TIKTOK_COOKIES_RAW = os.environ.get("TIKTOK_COOKIES", "").strip()
 TIKTOK_VIDEO_RE = re.compile(r'https://www\.tiktok\.com/@[\w.]+/video/\d+')
 SAMESITE_MAP    = {"no_restriction": "None", "lax": "Lax", "strict": "Strict", "none": "None"}
 
-# ─── COOKIE HELPERS ────────────────────────────────────────────────────────[...]
+# ─── COOKIE HELPERS ────────────────────────────────────────────────────────[[...]
 def clean_cookies(arr: list) -> list:
     """Normalize a raw cookie array into Playwright-ready format."""
     cleaned, seen = [], set()
@@ -111,7 +111,7 @@ def process_cookie_file(raw_text: str):
 COOKIES: list = load_cookies_from_raw(TIKTOK_COOKIES_RAW)
 logger.info("Loaded %d cookies from TIKTOK_COOKIES env var", len(COOKIES))
 
-# ─── AUTH ───────────────────────────────────────────────────────────[...]
+# ─── AUTH ───────────────────────────────────────────────────────────[[...]
 def is_allowed(uid: int) -> bool:
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
@@ -130,12 +130,13 @@ user_state = defaultdict(lambda: {
     "fmt": "csv", "status_msg_id": None, "target": 0,
 })
 
-# ─── SCRAPER ──────────────────────────────────────────────────────────[...]
+# ─── SCRAPER ──────────────────────────────────────────────────────────[[...]
 def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
     try:
         from playwright.sync_api import sync_playwright
 
         collected, seen, api_buffer = [], set(), []
+        debug_path = None
 
         logger.info("🚀 SCRAPER START: user=%d, target=%d, cookies=%d", user_id, target, len(COOKIES))
 
@@ -300,7 +301,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                     page.keyboard.press("ArrowDown")
                 except Exception as e:
                     logger.debug("Scroll error: %s", e)
-                time.sleep(3)
+                time.sleep(4)  # Increased from 3 to 4 seconds for better loading
                 scroll_attempts += 1
                 if scroll_attempts % 5 == 0:
                     logger.info("⬇️ Scroll: %d/%d attempts, collected: %d/%d (stuck: %d)", 
@@ -336,14 +337,18 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
             if not collected:
                 logger.warning("⚠️ NO VIDEOS COLLECTED - taking debug screenshot")
                 try:
-                    page.screenshot(path="/tmp/debug.png")
-                    logger.info("   ✓ Debug screenshot saved")
+                    # Use a temporary file that persists
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                        debug_path = tmp.name
+                    page.screenshot(path=debug_path)
+                    logger.info("   ✓ Debug screenshot saved to %s", debug_path)
                 except Exception as e:
                     logger.error("   ✗ Screenshot failed: %s", e)
 
             browser.close()
 
         user_state[user_id]["results"] = collected
+        user_state[user_id]["debug_path"] = debug_path  # Store for later retrieval
         on_done(collected)
 
     except Exception as e:
@@ -551,9 +556,14 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 Taking screenshot (~15s)...")
 
     def _run():
+        screenshot_path = None
         try:
             from playwright.sync_api import sync_playwright
             logger.info("📸 /debug: Starting screenshot...")
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                screenshot_path = tmp.name
+            
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
@@ -572,11 +582,12 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=30000)
                 time.sleep(6)
                 logger.info("   → Taking screenshot...")
-                page.screenshot(path="/tmp/debug.png")
-                logger.info("   ✓ Screenshot saved")
+                page.screenshot(path=screenshot_path)
+                logger.info("   ✓ Screenshot saved to %s", screenshot_path)
                 browser.close()
             
-            with open("/tmp/debug.png", "rb") as f:
+            # Send the screenshot to user
+            with open(screenshot_path, "rb") as f:
                 logger.info("   → Sending to user...")
                 asyncio.run_coroutine_threadsafe(
                     ctx.bot.send_photo(
@@ -589,6 +600,14 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.run_coroutine_threadsafe(
                 ctx.bot.send_message(chat_id=uid, text="❌ Screenshot failed: " + str(e)), loop
             )
+        finally:
+            # Cleanup
+            if screenshot_path and os.path.exists(screenshot_path):
+                try:
+                    os.unlink(screenshot_path)
+                    logger.info("   → Cleaned up temporary screenshot")
+                except Exception:
+                    pass
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -652,7 +671,7 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unknown command. Use /help.")
 
 
-# ─── MAIN ───────────────────────────────────────────────────────────[...]
+# ─── MAIN ───────────────────────────────────────────────────────────[[...]
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
