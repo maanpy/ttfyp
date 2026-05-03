@@ -326,19 +326,18 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cookie_status = "✅ " + str(len(COOKIES)) + " cookies loaded" if COOKIES else "❌ No cookies — set TIKTOK_COOKIES in Railway"
     await update.message.reply_text(
-        "🎵 *TikTok FYP Scraper Bot*\n"
+        "🎵 TikTok FYP Scraper Bot\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
         "🍪 Cookies: " + cookie_status + "\n\n"
-        "▶️ /scrape `<amount>` — Start scraping\n"
+        "▶ /scrape <amount> — Start scraping\n"
         "⏹ /stop — Stop scrape\n"
         "📊 /status — Check progress\n"
         "📥 /download — Download results\n"
         "✅ /check — Verify session works\n"
         "🖥 /debug — Screenshot what bot sees\n\n"
-        "📎 *To update cookies:* send a `.json` file\n"
-        "   exported from Cookie\\-Editor extension\n"
-        "   → bot replies with Railway\\-ready value",
-        parse_mode="Markdown"
+        "📎 To update cookies: send a .json file\n"
+        "   exported from Cookie-Editor extension\n"
+        "   Bot replies with the Railway-ready value"
     )
 
 @auth_required
@@ -355,11 +354,11 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not COOKIES:
             text = (
                 "❌ *No cookies loaded*\n\n"
-                "Set `TIKTOK_COOKIES` in Railway variables.\n"
-                "Send a `.json` cookie file here to get the value."
+                "Set TIKTOK_COOKIES in Railway variables.\n"
+                "Send a .json cookie file here to get the value."
             )
             asyncio.run_coroutine_threadsafe(
-                ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text, parse_mode="Markdown"), loop
+                ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text), loop
             )
             return
 
@@ -368,8 +367,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.run_coroutine_threadsafe(
                 ctx.bot.edit_message_text(
                     chat_id=uid, message_id=msg.message_id,
-                    text="❌ *No sessionid in cookies*\n\nSend a fresh `.json` cookie file to get a new Railway value.",
-                    parse_mode="Markdown"
+                    text="❌ No sessionid in cookies. Send a fresh .json cookie file to get a new Railway value."
                 ), loop
             )
             return
@@ -393,15 +391,15 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "✅ *Session valid!*\n\n"
                     "🍪 Cookies: `" + str(len(COOKIES)) + "`\n"
                     "🔑 sessionid: `" + sid[:16] + "...`\n\n"
-                    "Ready! Use /scrape `<amount>`"
+                    "Ready! Use /scrape <amount>"
                 )
             else:
-                text = "⚠️ *Session may be expired* (status: " + str(scode) + ")\n\nSend a fresh `.json` cookie file."
+                text = "⚠️ *Session may be expired* (status: " + str(scode) + ")\n\nSend a fresh .json cookie file."
         except Exception as e:
             text = "❌ Check failed: `" + str(e) + "`"
 
         asyncio.run_coroutine_threadsafe(
-            ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text, parse_mode="Markdown"), loop
+            ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text), loop
         )
 
     threading.Thread(target=_run, daemon=True).start()
@@ -415,13 +413,13 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Already running! Use /stop first.")
         return
     if not COOKIES:
-        await update.message.reply_text("❌ No cookies loaded!\n\nSet `TIKTOK_COOKIES` in Railway, or send a `.json` cookie file here.", parse_mode="Markdown")
+        await update.message.reply_text("❌ No cookies loaded!\n\nSet TIKTOK_COOKIES in Railway, or send a .json cookie file here.")
         return
 
     try:
         target = max(1, min(500, int(ctx.args[0]))) if ctx.args else 20
     except (ValueError, IndexError):
-        await update.message.reply_text("Usage: /scrape `<amount>`\nExample: /scrape 50", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /scrape <amount>\nExample: /scrape 50")
         return
 
     state["running"]    = True
@@ -431,7 +429,7 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop_event"] = stop_event
 
     status_msg = await update.message.reply_text(
-        "🔄 *Scraping 0 / " + str(target) + " videos...*", parse_mode="Markdown"
+        "🔄 Scraping 0 / " + str(target) + " videos..."
     )
     state["status_msg_id"] = status_msg.message_id
     loop = asyncio.get_event_loop()
@@ -440,8 +438,7 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
                 chat_id=uid, message_id=state["status_msg_id"],
-                text="🔄 *Scraping " + str(count) + " / " + str(total) + " videos...*",
-                parse_mode="Markdown"
+                text="🔄 Scraping " + str(count) + " / " + str(total) + " videos..."
             ), loop
         )
 
@@ -450,8 +447,7 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
                 chat_id=uid, message_id=state["status_msg_id"],
-                text="✅ *Done!*\n\n🎵 Collected *" + str(len(results)) + " / " + str(target) + "* videos\n📥 Use /download to get your file",
-                parse_mode="Markdown"
+                text="✅ *Done!*\n\n🎵 Collected *" + str(len(results)) + " / " + str(target) + "* videos\n📥 Use /download to get your file"
             ), loop
         )
 
@@ -460,8 +456,7 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
                 chat_id=uid, message_id=state["status_msg_id"],
-                text="❌ *Error:* `" + str(err) + "`\n\nTry /debug to see what's happening.",
-                parse_mode="Markdown"
+                text="❌ Error: " + str(err) + "\n\nTry /debug to see what is happening."
             ), loop
         )
 
@@ -477,14 +472,14 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop_event"].set()
     state["running"] = False
     count = len(state["results"])
-    text  = "⏹ *Stopped!*\n\nCollected *" + str(count) + "* videos.\nUse /download to get them."
+    text  = "⏹ Stopped! Collected " + str(count) + " videos.\nUse /download to get them."
     if state.get("status_msg_id"):
         try:
-            await ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text=text, parse_mode="Markdown")
+            await ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text=text)
             return
         except Exception:
             pass
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 @auth_required
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -492,16 +487,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = user_state[uid]
     count = len(state["results"])
     if state["running"]:
-        await update.message.reply_text("🔄 *Running*\n\nCollected: *" + str(count) + " / " + str(state["target"]) + "* videos", parse_mode="Markdown")
+        await update.message.reply_text("🔄 Running\n\nCollected: " + str(count) + " / " + str(state["target"]) + " videos")
     else:
-        await update.message.reply_text("💤 *Idle*\n\nLast run: *" + str(count) + "* videos\nUse /scrape `<amount>` to start", parse_mode="Markdown")
+        await update.message.reply_text("💤 Idle\n\nLast run: " + str(count) + " videos\nUse /scrape <amount> to start")
 
 @auth_required
 async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
     results = user_state[uid]["results"]
     if not results:
-        await update.message.reply_text("No results yet. Run /scrape `<amount>` first.", parse_mode="Markdown")
+        await update.message.reply_text("No results yet. Run /scrape <amount> first.")
         return
     ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     buf = StringIO()
@@ -563,7 +558,7 @@ async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
 
     if not (doc.file_name or "").lower().endswith(".json"):
-        await update.message.reply_text("Please send a `.json` file exported from Cookie-Editor.", parse_mode="Markdown")
+        await update.message.reply_text("Please send a .json file exported from Cookie-Editor.")
         return
 
     processing_msg = await update.message.reply_text("⏳ Processing cookie file...")
@@ -590,7 +585,7 @@ async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await ctx.bot.edit_message_text(
         chat_id=uid, message_id=processing_msg.message_id,
-        text=summary, parse_mode="Markdown"
+        text=summary
     )
 
     # Send the Railway value as a downloadable .txt file (no size issues)
@@ -601,12 +596,11 @@ async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "📋 *How to use this file:*\n\n"
             "1️⃣ Open the file and copy ALL contents\n"
             "2️⃣ Go to Railway → your service → Variables\n"
-            "3️⃣ Add variable: `TIKTOK_COOKIES`\n"
+            "3️⃣ Add variable: TIKTOK_COOKIES\n"
             "4️⃣ Paste the file contents as the value\n"
             "5️⃣ Redeploy the service\n\n"
             "Then use /check to verify it works!"
-        ),
-        parse_mode="Markdown"
+        )
     )
 
 
