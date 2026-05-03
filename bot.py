@@ -111,7 +111,7 @@ def process_cookie_file(raw_text: str):
 COOKIES: list = load_cookies_from_raw(TIKTOK_COOKIES_RAW)
 logger.info("Loaded %d cookies from TIKTOK_COOKIES env var", len(COOKIES))
 
-# ─��─ AUTH ───────────────────────────────────────────────────────────[...]
+# ─── AUTH ───────────────────────────────────────────────────────────[...]
 def is_allowed(uid: int) -> bool:
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
@@ -136,6 +136,8 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
         from playwright.sync_api import sync_playwright
 
         collected, seen, api_buffer = [], set(), []
+
+        logger.info("🚀 SCRAPER START: user=%d, target=%d, cookies=%d", user_id, target, len(COOKIES))
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -166,9 +168,9 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
 
             if COOKIES:
                 context.add_cookies(COOKIES)
-                logger.info("Scraper: Using %d cookies", len(COOKIES))
+                logger.info("✅ Cookies added: %d total", len(COOKIES))
             else:
-                logger.warning("Scraper: No cookies loaded - may fail!")
+                logger.warning("⚠️ NO COOKIES - scraping may fail!")
 
             def on_response(response):
                 try:
@@ -184,26 +186,27 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                                 body.get("itemList") or
                                 body.get("item_list") or []
                             )
-                            logger.info("API Response: Found %d items in feed", len(items))
+                            if items:
+                                logger.info("📡 API RESPONSE: %d items in feed", len(items))
                             for item in items:
                                 vid_id = item.get("aweme_id") or item.get("id")
                                 author = (item.get("author") or {}).get("unique_id")
                                 if vid_id and author:
                                     url_str = "https://www.tiktok.com/@" + str(author) + "/video/" + str(vid_id)
                                     api_buffer.append(url_str)
-                                    logger.debug("Added video: %s", url_str)
+                                    logger.info("   → Added to buffer: %s", url_str)
                         except Exception as e:
-                            logger.debug("Failed to parse response: %s", e)
+                            logger.warning("   ✗ Failed to parse: %s", e)
                 except Exception as e:
                     logger.debug("Response handler error: %s", e)
 
             page = context.new_page()
             page.on("response", on_response)
-            logger.info("Navigating to TikTok FYP...")
+            logger.info("🌐 Navigating to TikTok FYP...")
 
             page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=45000)
             time.sleep(8)
-            logger.info("Page loaded, closing popups...")
+            logger.info("✓ Page loaded")
 
             for sel in [
                 "button:has-text('Accept all')",
@@ -213,16 +216,16 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                 try:
                     page.click(sel, timeout=2000)
                     time.sleep(0.5)
-                    logger.info("Closed popup: %s", sel)
+                    logger.info("✓ Closed popup")
                 except Exception:
                     pass
 
             try:
                 page.wait_for_selector("a[href*='/video/']", timeout=15000)
                 time.sleep(2)
-                logger.info("Video elements loaded")
+                logger.info("✓ Video elements found on page")
             except Exception as e:
-                logger.warning("Could not wait for video elements: %s", e)
+                logger.warning("⚠️ Could not find video elements: %s", e)
 
             try:
                 page.mouse.click(640, 450)
@@ -238,7 +241,8 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
 
             def flush():
                 nonlocal api_buffer
-                logger.info("Flushing: api_buffer has %d items, collected has %d", len(api_buffer), len(collected))
+                if api_buffer:
+                    logger.info("💾 FLUSH: api_buffer=%d, collected=%d", len(api_buffer), len(collected))
                 for url in list(api_buffer):
                     clean = url.split("?")[0]
                     if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
@@ -248,7 +252,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                             "url":        clean,
                             "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                         })
-                        logger.info("Added from API: %s (total: %d)", clean, len(collected))
+                        logger.info("   ✓ Added from API: %s (%d/%d)", clean[:50], len(collected), target)
                         if len(collected) >= target:
                             break
                 api_buffer.clear()
@@ -257,7 +261,8 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                     try:
                         page_content = page.content()
                         html_urls = TIKTOK_VIDEO_RE.findall(page_content)
-                        logger.info("Found %d URLs in page HTML", len(html_urls))
+                        if html_urls:
+                            logger.info("   Found %d URLs in HTML", len(html_urls))
                         for url in html_urls:
                             clean = url.split("?")[0]
                             if clean not in seen:
@@ -267,15 +272,15 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                                     "url":        clean,
                                     "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                                 })
-                                logger.info("Added from HTML: %s (total: %d)", clean, len(collected))
+                                logger.info("   ✓ Added from HTML: %s (%d/%d)", clean[:50], len(collected), target)
                                 if len(collected) >= target:
                                     break
                     except Exception as e:
-                        logger.error("Error extracting URLs from page: %s", e)
+                        logger.error("✗ Error extracting HTML URLs: %s", e)
 
             while len(collected) < target and scroll_attempts < max_attempts:
                 if stop_event.is_set():
-                    logger.info("Stop event triggered")
+                    logger.info("⏹ Stop event triggered")
                     break
 
                 flush()
@@ -285,6 +290,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                     last_update_sent = len(collected)
 
                 if len(collected) >= target:
+                    logger.info("✅ Reached target!")
                     break
 
                 stuck_count = 0 if len(collected) > last_count else stuck_count + 1
@@ -296,10 +302,12 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                     logger.debug("Scroll error: %s", e)
                 time.sleep(3)
                 scroll_attempts += 1
-                logger.debug("Scroll attempt %d/%d, collected: %d", scroll_attempts, max_attempts, len(collected))
+                if scroll_attempts % 5 == 0:
+                    logger.info("⬇️ Scroll: %d/%d attempts, collected: %d/%d (stuck: %d)", 
+                               scroll_attempts, max_attempts, len(collected), target, stuck_count)
 
                 if stuck_count >= 8:
-                    logger.warning("Stuck at %d items — running recovery", len(collected))
+                    logger.warning("🔄 STUCK RECOVERY: At %d items, running recovery...", len(collected))
                     try:
                         page.mouse.click(640, 450)
                         time.sleep(1)
@@ -307,8 +315,9 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                         time.sleep(2)
                         page.evaluate("window.scrollBy(0, 500)")
                         time.sleep(1)
+                        logger.info("   ✓ Recovery completed")
                     except Exception as e:
-                        logger.error("Recovery failed: %s", e)
+                        logger.error("   ✗ Recovery failed: %s", e)
                     stuck_count = 0
 
                 if scroll_attempts % 20 == 0:
@@ -322,14 +331,15 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
 
             flush()
 
-            logger.info("Scraping complete: %d videos collected", len(collected))
+            logger.info("🏁 SCRAPER COMPLETE: Collected %d videos", len(collected))
 
             if not collected:
+                logger.warning("⚠️ NO VIDEOS COLLECTED - taking debug screenshot")
                 try:
                     page.screenshot(path="/tmp/debug.png")
-                    logger.info("Debug screenshot saved (no videos found)")
+                    logger.info("   ✓ Debug screenshot saved")
                 except Exception as e:
-                    logger.error("Screenshot failed: %s", e)
+                    logger.error("   ✗ Screenshot failed: %s", e)
 
             browser.close()
 
@@ -337,7 +347,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
         on_done(collected)
 
     except Exception as e:
-        logger.exception("Scraper error")
+        logger.exception("💥 SCRAPER CRASHED")
         on_error(str(e))
 
 
@@ -395,12 +405,12 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         try:
             import requests as req
+            logger.info("📋 /check: Testing session with %d cookies", len(COOKIES))
             cookie_dict = {c["name"]: c["value"] for c in COOKIES}
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
                 "Referer": "https://www.tiktok.com/",
             }
-            logger.info("Check: Testing session with %d cookies", len(COOKIES))
             resp  = req.get(
                 "https://www.tiktok.com/api/recommend/item_list/?count=1&aid=1988",
                 headers=headers, cookies=cookie_dict, timeout=15
@@ -408,7 +418,8 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data  = resp.json()
             items = data.get("itemList") or data.get("aweme_list") or []
             scode = data.get("statusCode", data.get("status_code", -1))
-            logger.info("Check: API response status=%d, items=%d", scode, len(items))
+            logger.info("   → Status: %d, Items: %d", scode, len(items))
+            
             if items or scode == 0:
                 text = (
                     "✅ *Session valid!*\n\n"
@@ -419,7 +430,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 text = "⚠️ *Session may be expired* (status: " + str(scode) + ")\n\nSend a fresh .json cookie file."
         except Exception as e:
-            logger.exception("Check failed")
+            logger.exception("❌ /check FAILED")
             text = "❌ Check failed: `" + str(e) + "`"
 
         asyncio.run_coroutine_threadsafe(
@@ -542,7 +553,7 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     def _run():
         try:
             from playwright.sync_api import sync_playwright
-            logger.info("Debug: Starting screenshot...")
+            logger.info("📸 /debug: Starting screenshot...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
@@ -555,18 +566,18 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
                 if COOKIES:
                     context.add_cookies(COOKIES)
-                    logger.info("Debug: Added %d cookies", len(COOKIES))
+                    logger.info("   ✓ Added %d cookies", len(COOKIES))
                 page = context.new_page()
-                logger.info("Debug: Navigating to TikTok...")
+                logger.info("   → Navigating to TikTok...")
                 page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=30000)
                 time.sleep(6)
-                logger.info("Debug: Taking screenshot...")
+                logger.info("   → Taking screenshot...")
                 page.screenshot(path="/tmp/debug.png")
-                logger.info("Debug: Screenshot saved")
+                logger.info("   ✓ Screenshot saved")
                 browser.close()
             
             with open("/tmp/debug.png", "rb") as f:
-                logger.info("Debug: Sending screenshot to user...")
+                logger.info("   → Sending to user...")
                 asyncio.run_coroutine_threadsafe(
                     ctx.bot.send_photo(
                         chat_id=uid, photo=f,
@@ -574,7 +585,7 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ), loop
                 )
         except Exception as e:
-            logger.exception("Debug screenshot failed")
+            logger.exception("❌ /debug FAILED")
             asyncio.run_coroutine_threadsafe(
                 ctx.bot.send_message(chat_id=uid, text="❌ Screenshot failed: " + str(e)), loop
             )
@@ -600,6 +611,7 @@ async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         raw_bytes = await tg_file.download_as_bytearray()
         raw_text  = raw_bytes.decode("utf-8")
     except Exception as e:
+        logger.exception("Failed to download cookie file")
         await ctx.bot.edit_message_text(
             chat_id=uid, message_id=processing_msg.message_id,
             text="❌ Failed to read file: " + str(e)
