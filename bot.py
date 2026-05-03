@@ -18,7 +18,7 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# ─── CONFIG ───────────────────────────────────────────────────────────[...]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_USERS_RAW  = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS      = set(int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip())
@@ -27,7 +27,7 @@ TIKTOK_COOKIES_RAW = os.environ.get("TIKTOK_COOKIES", "").strip()
 TIKTOK_VIDEO_RE = re.compile(r'https://www\.tiktok\.com/@[\w.]+/video/\d+')
 SAMESITE_MAP    = {"no_restriction": "None", "lax": "Lax", "strict": "Strict", "none": "None"}
 
-# ─── COOKIE HELPERS ───────────────────────────────────────────────────────────
+# ─── COOKIE HELPERS ────────────────────────────────────────────────────────…[...]
 def clean_cookies(arr: list) -> list:
     """Normalize a raw cookie array into Playwright-ready format."""
     cleaned, seen = [], set()
@@ -111,7 +111,7 @@ def process_cookie_file(raw_text: str):
 COOKIES: list = load_cookies_from_raw(TIKTOK_COOKIES_RAW)
 logger.info("Loaded %d cookies from TIKTOK_COOKIES env var", len(COOKIES))
 
-# ─── AUTH ─────────────────────────────────────────────────────────────────────
+# ─── AUTH ───────────────────────────────────────────────────────────…[...]
 def is_allowed(uid: int) -> bool:
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
@@ -124,13 +124,13 @@ def auth_required(func):
     wrapper.__name__ = func.__name__
     return wrapper
 
-# ─── STATE ────────────────────────────────────────────────────────────────────
+# ─── STATE ───────────────────────────────────────────────────────────[...]
 user_state = defaultdict(lambda: {
     "running": False, "results": [], "stop_event": None,
     "fmt": "csv", "status_msg_id": None, "target": 0,
 })
 
-# ─── SCRAPER ──────────────────────────────────────────────────────────────────
+# ─── SCRAPER ──────────────────────────────────────────────────────────…[...]
 def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
     try:
         from playwright.sync_api import sync_playwright
@@ -320,7 +320,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
         on_error(str(e))
 
 
-# ─── COMMANDS ─────────────────────────────────────────────────────────────────
+# ─── COMMANDS ──────────────────────────────────────────────────────────[...]
 
 @auth_required
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -550,7 +550,7 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ─── JSON FILE HANDLER ────────────────────────────────────────────────────────
+# ─── JSON FILE HANDLER ───────────────────────────────────────────────────────[...]
 @auth_required
 async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """User sends a .json cookie file → bot replies with the Railway-ready value."""
@@ -608,7 +608,7 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unknown command. Use /help.")
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ───────────────────────────────────────────────────────────…[...]
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
@@ -625,7 +625,7 @@ def main():
     # Catch-all for unknown commands
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
     logger.info("Bot started! Cookies loaded: %d", len(COOKIES))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
