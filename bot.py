@@ -1,5 +1,7 @@
 """
-TikTok FYP Scraper Bot — Complete Rebuild
+TikTok FYP Scraper Bot
+- Set TIKTOK_COOKIES in Railway as JSON array from Cookie-Editor
+- Or send a .json cookie file directly to the bot -> it replies with the Railway value
 """
 
 import os, csv, re, time, asyncio, logging, threading, json
@@ -7,9 +9,9 @@ from io import StringIO
 from datetime import datetime
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ApplicationBuilder, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
 
@@ -21,49 +23,96 @@ TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_USERS_RAW  = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS      = set(int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip())
 TIKTOK_COOKIES_RAW = os.environ.get("TIKTOK_COOKIES", "").strip()
-# ──────────────────────────────────────────────────────────────────────────────
 
 TIKTOK_VIDEO_RE = re.compile(r'https://www\.tiktok\.com/@[\w.]+/video/\d+')
 SAMESITE_MAP    = {"no_restriction": "None", "lax": "Lax", "strict": "Strict", "none": "None"}
 
+# ─── COOKIE HELPERS ───────────────────────────────────────────────────────────
+def clean_cookies(arr: list) -> list:
+    """Normalize a raw cookie array into Playwright-ready format."""
+    cleaned, seen = [], set()
+    for c in arr:
+        name  = c.get("name", "")
+        value = c.get("value", "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        raw_ss = (c.get("sameSite") or "lax").lower()
+        out = {
+            "name":     name,
+            "value":    str(value),
+            "domain":   ".tiktok.com",
+            "path":     "/",
+            "secure":   bool(c.get("secure", False)),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "sameSite": SAMESITE_MAP.get(raw_ss, "Lax"),
+        }
+        exp = c.get("expirationDate") or c.get("expires")
+        if exp:
+            try:
+                out["expires"] = int(float(exp))
+            except Exception:
+                pass
+        cleaned.append(out)
+    return cleaned
 
-def parse_cookies(raw: str) -> list:
+
+def load_cookies_from_raw(raw: str) -> list:
+    """Parse TIKTOK_COOKIES env var — expects a JSON array string."""
     if not raw:
         return []
     try:
-        cookies = json.loads(raw)
-        cleaned, seen = [], set()
-        for c in cookies:
-            name = c.get("name", "")
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            out = {
-                "name": name,
-                "value": c.get("value", ""),
-                "domain": ".tiktok.com",
-                "path": "/",
-                "secure": bool(c.get("secure", False)),
-                "httpOnly": bool(c.get("httpOnly", False)),
-                "sameSite": SAMESITE_MAP.get((c.get("sameSite") or "lax").lower(), "Lax"),
-            }
-            exp = c.get("expirationDate") or c.get("expires")
-            if exp:
-                try:
-                    out["expires"] = int(float(exp))
-                except Exception:
-                    pass
-            cleaned.append(out)
-        return cleaned
+        arr = json.loads(raw)
+        if isinstance(arr, list):
+            return clean_cookies(arr)
     except Exception as e:
-        logger.warning("Cookie parse failed: %s", e)
-        return []
+        logger.warning("Failed to parse TIKTOK_COOKIES: %s", e)
+    return []
 
 
-COOKIES = parse_cookies(TIKTOK_COOKIES_RAW)
+def process_cookie_file(raw_text: str):
+    """
+    Parse a cookie JSON file uploaded by user.
+    Returns (railway_value_string, summary_text, error_text)
+    """
+    try:
+        arr = json.loads(raw_text.strip())
+    except Exception as e:
+        return None, None, f"Could not parse JSON: {e}"
+
+    if not isinstance(arr, list):
+        return None, None, "Expected a JSON array (starting with [). Export again from Cookie-Editor."
+
+    cleaned = clean_cookies(arr)
+    if not cleaned:
+        return None, None, "No cookies found after parsing. Try exporting again."
+
+    names       = [c["name"] for c in cleaned]
+    key_names   = ["sessionid", "sid_tt", "uid_tt", "odin_tt", "msToken"]
+    found       = [k for k in key_names if k in names]
+    missing     = [k for k in key_names if k not in names]
+    has_session = "sessionid" in names
+    sid_preview = next((c["value"][:16] + "..." for c in cleaned if c["name"] == "sessionid"), "not found")
+
+    summary = (
+        ("✅" if has_session else "⚠️") + " *Cookie File Processed*\n\n"
+        "Total cookies: `" + str(len(cleaned)) + "`\n"
+        "Found: `" + ", ".join(found) + "`\n"
+        + ("Missing: `" + ", ".join(missing) + "`\n" if missing else "")
+        + "sessionid: `" + sid_preview + "`\n\n"
+        + ("✅ Ready to use!" if has_session else "⚠️ No sessionid — may not work!")
+    )
+
+    railway_value = json.dumps(cleaned, separators=(",", ":"))
+    return railway_value, summary, None
+
+
+# Load cookies at startup from env var
+COOKIES: list = load_cookies_from_raw(TIKTOK_COOKIES_RAW)
+logger.info("Loaded %d cookies from TIKTOK_COOKIES env var", len(COOKIES))
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
-def is_allowed(uid):
+def is_allowed(uid: int) -> bool:
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
 def auth_required(func):
@@ -77,68 +126,9 @@ def auth_required(func):
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 user_state = defaultdict(lambda: {
-    "running": False,
-    "results": [],
-    "stop_event": None,
-    "fmt": "csv",
-    "status_msg_id": None,
-    "target": 0,
+    "running": False, "results": [], "stop_event": None,
+    "fmt": "csv", "status_msg_id": None, "target": 0,
 })
-
-# ─── COOKIE PROCESSOR ─────────────────────────────────────────────────────────
-def process_raw_cookies(raw_text: str):
-    try:
-        data = json.loads(raw_text.strip())
-    except Exception:
-        return "", "Could not parse JSON. Make sure you export from Cookie-Editor as JSON format."
-
-    if not isinstance(data, list):
-        return "", "Expected a JSON array starting with ["
-
-    cleaned, seen = [], set()
-    for c in data:
-        name = c.get("name", "") or c.get("Name raw", "")
-        value = c.get("value", "") or c.get("Content raw", "")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        raw_ss = c.get("sameSite") or c.get("SameSite raw") or "lax"
-        out = {
-            "name": name,
-            "value": value,
-            "domain": ".tiktok.com",
-            "path": "/",
-            "secure": bool(c.get("secure", False)),
-            "httpOnly": bool(c.get("httpOnly", c.get("HTTP only raw", "false")) in [True, "true"]),
-            "sameSite": SAMESITE_MAP.get(raw_ss.lower(), "Lax"),
-        }
-        exp = c.get("expirationDate") or c.get("expires") or c.get("Expires raw")
-        if exp:
-            try:
-                out["expires"] = int(float(exp))
-            except Exception:
-                pass
-        cleaned.append(out)
-
-    names       = {c["name"] for c in cleaned}
-    key_cookies = ["sessionid", "sid_tt", "uid_tt", "odin_tt", "msToken"]
-    found       = [k for k in key_cookies if k in names]
-    missing     = [k for k in key_cookies if k not in names]
-
-    has_session = "sessionid" in names
-    sid_val     = next((c["value"][:16] + "..." for c in cleaned if c["name"] == "sessionid"), "not found")
-
-    summary = (
-        "Cookie Processing Result\n\n"
-        "Total cookies: " + str(len(cleaned)) + "\n"
-        "Found: " + ", ".join(found) + "\n"
-        + ("Missing: " + ", ".join(missing) + "\n" if missing else "")
-        + "\nsessionid: " + sid_val
-        + ("\n\nReady to use!" if has_session else "\n\nWarning: no sessionid found - may not work!")
-    )
-
-    railway_value = json.dumps(cleaned, separators=(",", ":"))
-    return railway_value, summary
 
 # ─── SCRAPER ──────────────────────────────────────────────────────────────────
 def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
@@ -151,10 +141,8 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
             browser = p.chromium.launch(
                 headless=True,
                 args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage", "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
                     "--window-size=1280,900",
                 ]
@@ -187,7 +175,7 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                         "item_list", "/api/recommend", "homepage/recommend"
                     ]):
                         try:
-                            body = response.json()
+                            body  = response.json()
                             items = (
                                 body.get("aweme_list") or
                                 body.get("itemList") or
@@ -246,14 +234,13 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                     if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
                         seen.add(clean)
                         collected.append({
-                            "index": len(collected) + 1,
-                            "url": clean,
+                            "index":      len(collected) + 1,
+                            "url":        clean,
                             "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                         })
                         if len(collected) >= target:
                             break
                 api_buffer.clear()
-
                 if len(collected) < target:
                     try:
                         for url in TIKTOK_VIDEO_RE.findall(page.content()):
@@ -261,8 +248,8 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                             if clean not in seen:
                                 seen.add(clean)
                                 collected.append({
-                                    "index": len(collected) + 1,
-                                    "url": clean,
+                                    "index":      len(collected) + 1,
+                                    "url":        clean,
                                     "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                                 })
                                 if len(collected) >= target:
@@ -283,14 +270,9 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                 if len(collected) >= target:
                     break
 
-                # Track stuck state
-                if len(collected) > last_count:
-                    stuck_count = 0
-                    last_count  = len(collected)
-                else:
-                    stuck_count += 1
+                stuck_count = 0 if len(collected) > last_count else stuck_count + 1
+                last_count  = len(collected)
 
-                # Navigate to next video
                 try:
                     page.keyboard.press("ArrowDown")
                 except Exception:
@@ -298,7 +280,6 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                 time.sleep(3)
                 scroll_attempts += 1
 
-                # Recovery if stuck
                 if stuck_count >= 8:
                     logger.warning("Stuck at %d — running recovery", len(collected))
                     try:
@@ -312,7 +293,6 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
                         pass
                     stuck_count = 0
 
-                # Every 20 scrolls: hard scroll to trigger lazy loading
                 if scroll_attempts % 20 == 0:
                     try:
                         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -340,22 +320,24 @@ def run_scraper(user_id, target, stop_event, on_update, on_done, on_error):
         on_error(str(e))
 
 
-# ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
 @auth_required
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cookie_status = "✅ " + str(len(COOKIES)) + " cookies loaded" if COOKIES else "❌ No cookies — set TIKTOK_COOKIES in Railway"
     await update.message.reply_text(
         "🎵 *TikTok FYP Scraper Bot*\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
+        "🍪 Cookies: " + cookie_status + "\n\n"
         "▶️ /scrape `<amount>` — Start scraping\n"
-        "   _e.g. /scrape 50_\n\n"
-        "⏹ /stop — Stop current scrape\n"
+        "⏹ /stop — Stop scrape\n"
         "📊 /status — Check progress\n"
         "📥 /download — Download results\n"
-        "✅ /check — Check if session is working\n"
-        "🍪 /setcookies — How to add your cookies\n"
-        "🖥 /debug — Screenshot what bot sees\n"
-        "❓ /help — Show this menu",
+        "✅ /check — Verify session works\n"
+        "🖥 /debug — Screenshot what bot sees\n\n"
+        "📎 *To update cookies:* send a `.json` file\n"
+        "   exported from Cookie\\-Editor extension\n"
+        "   → bot replies with Railway\\-ready value",
         parse_mode="Markdown"
     )
 
@@ -364,39 +346,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, ctx)
 
 @auth_required
-async def cmd_setcookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🍪 *How to set your TikTok cookies:*\n\n"
-        "1️⃣ Open TikTok in *Kiwi Browser* on Android\n"
-        "2️⃣ Install *Cookie-Editor* extension\n"
-        "3️⃣ Log into TikTok\n"
-        "4️⃣ Open Cookie-Editor\n"
-        "5️⃣ Tap *Export* then *JSON*\n"
-        "6️⃣ *Paste the JSON directly here* in this chat\n\n"
-        "I'll process it and send you the exact value to put in Railway! 🚀",
-        parse_mode="Markdown"
-    )
-
-@auth_required
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    msg = await update.message.reply_text("🔍 Checking session...")
+    uid  = update.effective_user.id
+    msg  = await update.message.reply_text("🔍 Checking session...")
     loop = asyncio.get_event_loop()
 
     def _run():
-        import requests as req
-
         if not COOKIES:
             text = (
                 "❌ *No cookies loaded*\n\n"
-                "Use /setcookies to learn how to add your cookies,\n"
-                "then set `TIKTOK_COOKIES` in Railway."
+                "Set `TIKTOK_COOKIES` in Railway variables.\n"
+                "Send a `.json` cookie file here to get the value."
             )
             asyncio.run_coroutine_threadsafe(
-                ctx.bot.edit_message_text(
-                    chat_id=uid, message_id=msg.message_id,
-                    text=text, parse_mode="Markdown"
-                ), loop,
+                ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text, parse_mode="Markdown"), loop
             )
             return
 
@@ -405,58 +368,43 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.run_coroutine_threadsafe(
                 ctx.bot.edit_message_text(
                     chat_id=uid, message_id=msg.message_id,
-                    text="❌ *No sessionid found in cookies*\n\nGet fresh cookies via /setcookies",
+                    text="❌ *No sessionid in cookies*\n\nSend a fresh `.json` cookie file to get a new Railway value.",
                     parse_mode="Markdown"
-                ), loop,
+                ), loop
             )
             return
 
         try:
+            import requests as req
             cookie_dict = {c["name"]: c["value"] for c in COOKIES}
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
                 "Referer": "https://www.tiktok.com/",
             }
-            resp = req.get(
+            resp  = req.get(
                 "https://www.tiktok.com/api/recommend/item_list/?count=1&aid=1988",
-                headers=headers,
-                cookies=cookie_dict,
-                timeout=15,
+                headers=headers, cookies=cookie_dict, timeout=15
             )
-            if resp.status_code == 200:
-                data   = resp.json()
-                items  = data.get("itemList") or data.get("aweme_list") or []
-                scode  = data.get("statusCode", data.get("status_code", -1))
-                if items or scode == 0:
-                    text = (
-                        "✅ *Session is valid!*\n\n"
-                        "🍪 Cookies loaded: " + str(len(COOKIES)) + "\n"
-                        "🔑 sessionid: `" + sid[:16] + "...`\n"
-                        "📡 API: OK\n\n"
-                        "Ready! Use /scrape `<amount>`"
-                    )
-                else:
-                    text = (
-                        "⚠️ *Session may be expired*\n"
-                        "API status: " + str(scode) + "\n\n"
-                        "Try refreshing via /setcookies"
-                    )
-            elif resp.status_code == 401:
-                text = "❌ *Session expired* (401)\n\nGet fresh cookies via /setcookies"
+            data  = resp.json()
+            items = data.get("itemList") or data.get("aweme_list") or []
+            scode = data.get("statusCode", data.get("status_code", -1))
+            if items or scode == 0:
+                text = (
+                    "✅ *Session valid!*\n\n"
+                    "🍪 Cookies: `" + str(len(COOKIES)) + "`\n"
+                    "🔑 sessionid: `" + sid[:16] + "...`\n\n"
+                    "Ready! Use /scrape `<amount>`"
+                )
             else:
-                text = "⚠️ HTTP " + str(resp.status_code) + " — try /debug to see what TikTok shows"
+                text = "⚠️ *Session may be expired* (status: " + str(scode) + ")\n\nSend a fresh `.json` cookie file."
         except Exception as e:
-            text = "❌ Check failed: " + str(e)
+            text = "❌ Check failed: `" + str(e) + "`"
 
         asyncio.run_coroutine_threadsafe(
-            ctx.bot.edit_message_text(
-                chat_id=uid, message_id=msg.message_id,
-                text=text, parse_mode="Markdown"
-            ), loop,
+            ctx.bot.edit_message_text(chat_id=uid, message_id=msg.message_id, text=text, parse_mode="Markdown"), loop
         )
 
     threading.Thread(target=_run, daemon=True).start()
-
 
 @auth_required
 async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -466,14 +414,12 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state["running"]:
         await update.message.reply_text("⚠️ Already running! Use /stop first.")
         return
-
     if not COOKIES:
-        await update.message.reply_text("❌ No cookies loaded! Use /setcookies first.")
+        await update.message.reply_text("❌ No cookies loaded!\n\nSet `TIKTOK_COOKIES` in Railway, or send a `.json` cookie file here.", parse_mode="Markdown")
         return
 
-    args = ctx.args
     try:
-        target = max(1, min(500, int(args[0]))) if args else 20
+        target = max(1, min(500, int(ctx.args[0]))) if ctx.args else 20
     except (ValueError, IndexError):
         await update.message.reply_text("Usage: /scrape `<amount>`\nExample: /scrape 50", parse_mode="Markdown")
         return
@@ -485,55 +431,41 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["stop_event"] = stop_event
 
     status_msg = await update.message.reply_text(
-        "🔄 *Scraping 0 / " + str(target) + " videos...*",
-        parse_mode="Markdown"
+        "🔄 *Scraping 0 / " + str(target) + " videos...*", parse_mode="Markdown"
     )
     state["status_msg_id"] = status_msg.message_id
-
     loop = asyncio.get_event_loop()
 
     def on_update(count, total):
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
-                chat_id=uid,
-                message_id=state["status_msg_id"],
+                chat_id=uid, message_id=state["status_msg_id"],
                 text="🔄 *Scraping " + str(count) + " / " + str(total) + " videos...*",
                 parse_mode="Markdown"
-            ), loop,
+            ), loop
         )
 
     def on_done(results):
         state["running"] = False
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
-                chat_id=uid,
-                message_id=state["status_msg_id"],
-                text=(
-                    "✅ *Done!*\n\n"
-                    "🎵 Collected *" + str(len(results)) + " / " + str(target) + "* videos\n"
-                    "📥 Use /download to get your file"
-                ),
+                chat_id=uid, message_id=state["status_msg_id"],
+                text="✅ *Done!*\n\n🎵 Collected *" + str(len(results)) + " / " + str(target) + "* videos\n📥 Use /download to get your file",
                 parse_mode="Markdown"
-            ), loop,
+            ), loop
         )
 
     def on_error(err):
         state["running"] = False
         asyncio.run_coroutine_threadsafe(
             ctx.bot.edit_message_text(
-                chat_id=uid,
-                message_id=state["status_msg_id"],
-                text="❌ *Error:* `" + str(err) + "`",
+                chat_id=uid, message_id=state["status_msg_id"],
+                text="❌ *Error:* `" + str(err) + "`\n\nTry /debug to see what's happening.",
                 parse_mode="Markdown"
-            ), loop,
+            ), loop
         )
 
-    threading.Thread(
-        target=run_scraper,
-        args=(uid, target, stop_event, on_update, on_done, on_error),
-        daemon=True
-    ).start()
-
+    threading.Thread(target=run_scraper, args=(uid, target, stop_event, on_update, on_done, on_error), daemon=True).start()
 
 @auth_required
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -548,15 +480,11 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = "⏹ *Stopped!*\n\nCollected *" + str(count) + "* videos.\nUse /download to get them."
     if state.get("status_msg_id"):
         try:
-            await ctx.bot.edit_message_text(
-                chat_id=uid, message_id=state["status_msg_id"],
-                text=text, parse_mode="Markdown"
-            )
+            await ctx.bot.edit_message_text(chat_id=uid, message_id=state["status_msg_id"], text=text, parse_mode="Markdown")
             return
         except Exception:
             pass
     await update.message.reply_text(text, parse_mode="Markdown")
-
 
 @auth_required
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -564,16 +492,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = user_state[uid]
     count = len(state["results"])
     if state["running"]:
-        await update.message.reply_text(
-            "🔄 *Running*\n\nCollected: *" + str(count) + " / " + str(state["target"]) + "* videos",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🔄 *Running*\n\nCollected: *" + str(count) + " / " + str(state["target"]) + "* videos", parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            "💤 *Idle*\n\nLast run: *" + str(count) + "* videos\nUse /scrape `<amount>` to start",
-            parse_mode="Markdown"
-        )
-
+        await update.message.reply_text("💤 *Idle*\n\nLast run: *" + str(count) + "* videos\nUse /scrape `<amount>` to start", parse_mode="Markdown")
 
 @auth_required
 async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -582,26 +503,16 @@ async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not results:
         await update.message.reply_text("No results yet. Run /scrape `<amount>` first.", parse_mode="Markdown")
         return
-    fmt = user_state[uid]["fmt"]
     ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    if fmt == "csv":
-        buf    = StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["index", "url", "scraped_at"])
-        writer.writeheader()
-        writer.writerows(results)
-        await update.message.reply_document(
-            document=buf.getvalue().encode(),
-            filename="tiktok_" + ts + ".csv",
-            caption="🎵 " + str(len(results)) + " TikTok video links"
-        )
-    else:
-        content = "\n".join(r["url"] for r in results)
-        await update.message.reply_document(
-            document=content.encode(),
-            filename="tiktok_" + ts + ".txt",
-            caption="🎵 " + str(len(results)) + " TikTok video links"
-        )
-
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["index", "url", "scraped_at"])
+    writer.writeheader()
+    writer.writerows(results)
+    await update.message.reply_document(
+        document=buf.getvalue().encode(),
+        filename="tiktok_" + ts + ".csv",
+        caption="🎵 " + str(len(results)) + " TikTok video links"
+    )
 
 @auth_required
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -615,7 +526,7 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
                 )
                 context = browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -633,47 +544,69 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 asyncio.run_coroutine_threadsafe(
                     ctx.bot.send_photo(
                         chat_id=uid, photo=f,
-                        caption="🖥 What TikTok shows the bot.\n✅ Feed visible = working\n❌ Login wall = cookies expired"
-                    ), loop,
+                        caption="✅ FYP = cookies working!\n❌ Login wall = cookies expired — send a fresh .json file."
+                    ), loop
                 )
         except Exception as e:
             asyncio.run_coroutine_threadsafe(
-                ctx.bot.send_message(chat_id=uid, text="❌ Screenshot failed: " + str(e)), loop,
+                ctx.bot.send_message(chat_id=uid, text="❌ Screenshot failed: " + str(e)), loop
             )
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ─── COOKIE PASTE HANDLER ─────────────────────────────────────────────────────
+# ─── JSON FILE HANDLER ────────────────────────────────────────────────────────
 @auth_required
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = (update.message.text or "").strip()
+async def handle_cookie_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User sends a .json cookie file → bot replies with the Railway-ready value."""
+    uid = update.effective_user.id
+    doc = update.message.document
 
-    if not (text.startswith("[") and text.endswith("]")):
-        await update.message.reply_text("Use /help to see commands.\nTo set cookies, use /setcookies first.")
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await update.message.reply_text("Please send a `.json` file exported from Cookie-Editor.", parse_mode="Markdown")
         return
 
-    await update.message.reply_text("⚙️ Processing your cookies...")
-    railway_value, summary = process_raw_cookies(text)
+    processing_msg = await update.message.reply_text("⏳ Processing cookie file...")
 
-    if not railway_value:
-        await update.message.reply_text("❌ " + summary)
+    try:
+        tg_file   = await ctx.bot.get_file(doc.file_id)
+        raw_bytes = await tg_file.download_as_bytearray()
+        raw_text  = raw_bytes.decode("utf-8")
+    except Exception as e:
+        await ctx.bot.edit_message_text(
+            chat_id=uid, message_id=processing_msg.message_id,
+            text="❌ Failed to read file: " + str(e)
+        )
         return
 
-    await update.message.reply_text(summary)
+    railway_value, summary, error = process_cookie_file(raw_text)
+
+    if error:
+        await ctx.bot.edit_message_text(
+            chat_id=uid, message_id=processing_msg.message_id,
+            text="❌ " + error
+        )
+        return
+
+    await ctx.bot.edit_message_text(
+        chat_id=uid, message_id=processing_msg.message_id,
+        text=summary, parse_mode="Markdown"
+    )
+
+    # Send the Railway value as a downloadable .txt file (no size issues)
     await update.message.reply_document(
         document=railway_value.encode(),
-        filename="TIKTOK_COOKIES.txt",
+        filename="TIKTOK_COOKIES_railway.txt",
         caption=(
-            "📋 Copy the contents of this file.\n\n"
-            "In Railway:\n"
-            "1. Go to your service Variables\n"
-            "2. Add variable named: TIKTOK_COOKIES\n"
-            "3. Paste file contents as the value\n"
-            "4. Redeploy\n\n"
+            "📋 *How to use this file:*\n\n"
+            "1️⃣ Open the file and copy ALL contents\n"
+            "2️⃣ Go to Railway → your service → Variables\n"
+            "3️⃣ Add variable: `TIKTOK_COOKIES`\n"
+            "4️⃣ Paste the file contents as the value\n"
+            "5️⃣ Redeploy the service\n\n"
             "Then use /check to verify it works!"
-        )
+        ),
+        parse_mode="Markdown"
     )
 
 
@@ -684,24 +617,21 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("help",       cmd_help))
-    app.add_handler(CommandHandler("scrape",     cmd_scrape))
-    app.add_handler(CommandHandler("stop",       cmd_stop))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("download",   cmd_download))
-    app.add_handler(CommandHandler("check",      cmd_check))
-    app.add_handler(CommandHandler("setcookies", cmd_setcookies))
-    app.add_handler(CommandHandler("debug",      cmd_debug))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started!")
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("scrape",   cmd_scrape))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("download", cmd_download))
+    app.add_handler(CommandHandler("check",    cmd_check))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
+    # JSON file upload handler
+    app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_cookie_file))
+    app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), handle_cookie_file))
+    # Catch-all for unknown commands
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    logger.info("Bot started! Cookies loaded: %d", len(COOKIES))
     app.run_polling(drop_pending_updates=True)
-
-
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
 
 
 if __name__ == "__main__":
